@@ -2,8 +2,8 @@
 > Understanding how packets traverse the Linux kernel networking stack
 
 ## Table of Contents
-1. [Core Concept: Netfilter Hooks](#1-core-concept-netfilter-hooks) - The 5 checkpoints
-2. [Tables and Chains](#2-tables-and-chains) - What runs where
+1. [Core Concepts: The Building Blocks](#1-core-concepts-the-building-blocks) - Hooks, Tables, Chains, Rules, Targets
+2. [Execution Order & Packet Flow](#2-execution-order--packet-flow) - Timeline and paths
 3. [Packet Flow Diagrams](#3-packet-flow-diagrams) - Visual paths
 4. [Connection Tracking (conntrack)](#4-connection-tracking-conntrack) - Stateful inspection
 5. [DevOps Use Cases](#5-devops-use-cases) - Real-world scenarios with debug commands
@@ -13,11 +13,43 @@
 
 ---
 
-## 1. Core Concept: Netfilter Hooks
+## 1. Core Concepts: The Building Blocks
 
-### The Mental Model
+### 1.0 Component Hierarchy
 
-A packet doesn't "go into iptables" once. It hits **specific checkpoints (hooks)** in the kernel networking stack. At each hook, netfilter consults rules in one or more tables.
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        NETFILTER/IPTABLES HIERARCHY                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   HOOK (kernel level)                                                       │
+│     │  Fixed checkpoint in network stack where packets can be intercepted   │
+│     │  5 hooks: PREROUTING, INPUT, FORWARD, OUTPUT, POSTROUTING             │
+│     │                                                                       │
+│     └──▶ TABLE (organizational layer)                                       │
+│           │  Groups chains by purpose (filtering, NAT, mangling)            │
+│           │  4 tables: raw, mangle, nat, filter                             │
+│           │                                                                 │
+│           └──▶ CHAIN (rule container)                                       │
+│                 │  Ordered list of rules, checked sequentially              │
+│                 │  Built-in chains named after hooks + custom chains        │
+│                 │                                                           │
+│                 └──▶ RULE (matching + action)                               │
+│                       │  Match criteria (src IP, port, protocol, etc.)      │
+│                       │                                                     │
+│                       └──▶ TARGET/ACTION (what to do)                       │
+│                             ACCEPT, DROP, REJECT, DNAT, SNAT, LOG, etc.     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 1.1 Hooks (Kernel Checkpoints)
+
+**What:** Fixed interception points hardcoded in the Linux kernel's network stack.
+
+**Think of it as:** Security checkpoints at an airport - you MUST pass through them at specific locations.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -36,8 +68,6 @@ A packet doesn't "go into iptables" once. It hits **specific checkpoints (hooks)
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### The 5 Hooks Explained
-
 | Hook | When It Fires | Typical Use |
 |------|---------------|-------------|
 | **PREROUTING** | Immediately after packet arrives on NIC, before routing decision | DNAT, port forwarding |
@@ -46,37 +76,160 @@ A packet doesn't "go into iptables" once. It hits **specific checkpoints (hooks)
 | **OUTPUT** | When local process generates a packet | Egress control |
 | **POSTROUTING** | Just before packet leaves the NIC | SNAT, masquerade |
 
-### Key Insight
+**Key property:** You cannot create, delete, or rename hooks - they are part of the kernel.
 
+---
+
+### 1.2 Tables (Functional Grouping)
+
+**What:** Organizational containers that group chains by purpose.
+
+**Think of it as:** Departments at the security checkpoint (customs, immigration, baggage).
+
+| Table | Purpose | When to Use |
+|-------|---------|-------------|
+| **raw** | Bypass connection tracking | Rarely; high-performance scenarios |
+| **mangle** | Modify packet headers (TTL, TOS, marks) | QoS, policy routing |
+| **nat** | Network Address Translation | SNAT, DNAT, MASQUERADE, port forwarding |
+| **filter** | Accept/Drop/Reject packets | Main firewall rules (most common) |
+
+**Processing order:** When multiple tables have chains at the same hook, they run in this order:
 ```
-Packet arrives → Kernel doesn't immediately "apply iptables rules"
-              → Kernel hits HOOKS in sequence
-              → Each hook may consult multiple TABLES
-              → Each table has CHAINS with rules
+raw → mangle → nat → filter
 ```
 
 ---
 
-## 2. Tables and Chains
+### 1.3 Chains (Rule Containers)
 
-### The 4 Tables (in order of precedence)
+**What:** Ordered lists of rules. Each chain is attached to a specific table AND hook.
+
+**Think of it as:** The actual checklist that security officers follow.
+
+**Two types of chains:**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        IPTABLES TABLES                          │
-├─────────────┬───────────────────────────────────────────────────┤
-│   TABLE     │   PURPOSE                                         │
-├─────────────┼───────────────────────────────────────────────────┤
-│   raw       │ Bypass connection tracking (NOTRACK)              │
-│   mangle    │ Modify packet headers (TTL, TOS, marks)           │
-│   nat       │ Network Address Translation (SNAT, DNAT, MASQ)    │
-│   filter    │ Accept/Drop/Reject packets (main firewall)        │
-└─────────────┴───────────────────────────────────────────────────┘
+│                         CHAIN TYPES                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  BUILT-IN CHAINS                    CUSTOM CHAINS               │
+│  ─────────────────                  ─────────────               │
+│  • Named after hooks                • User-defined              │
+│  • Created automatically            • Created with: iptables -N │
+│  • Cannot be deleted                • Can be deleted            │
+│  • Have a default POLICY            • No policy (must RETURN)   │
+│    (ACCEPT or DROP)                                             │
+│                                                                 │
+│  Examples:                          Examples:                   │
+│  • INPUT (filter table)             • MY_SSH_RULES              │
+│  • PREROUTING (nat table)           • DOCKER-USER               │
+│  • OUTPUT (raw table)               • ts-input (Tailscale)      │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Table-to-Chain Mapping
+**Chain flow:**
+```
+Packet → Built-in chain → [rule 1] → [rule 2] → ... → [jump to custom chain] → [back] → policy
+                              ↓           ↓                    ↓
+                           no match    no match             RETURN
+```
 
-Not all tables have all chains. Here's what exists:
+---
+
+### 1.4 Rules (Match + Target)
+
+**What:** Individual instructions within a chain. Each rule has two parts:
+1. **Match criteria** - conditions the packet must satisfy
+2. **Target/Action** - what to do if matched
+
+**Think of it as:** "IF packet matches X, THEN do Y"
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                          RULE ANATOMY                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  iptables -A INPUT -p tcp --dport 22 -s 10.0.0.0/8 -j ACCEPT   │
+│            ─────── ────── ────────── ───────────── ──────────  │
+│               │      │        │           │            │        │
+│               │      │        │           │            └─ TARGET│
+│               │      │        │           └─ MATCH: source IP   │
+│               │      │        └─ MATCH: destination port        │
+│               │      └─ MATCH: protocol                         │
+│               └─ CHAIN to append rule to                        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Rule evaluation:**
+```
+Packet enters chain
+      │
+      ▼
+┌─────────────┐    match?     ┌─────────────┐
+│   Rule 1    │──────YES─────▶│   Execute   │──▶ (packet leaves chain if terminal target)
+└─────────────┘               │   Target    │
+      │ NO                    └─────────────┘
+      ▼
+┌─────────────┐    match?     ┌─────────────┐
+│   Rule 2    │──────YES─────▶│   Execute   │──▶ ...
+└─────────────┘               │   Target    │
+      │ NO                    └─────────────┘
+      ▼
+     ...
+      │
+      ▼
+┌─────────────┐
+│   Policy    │  (default action if no rule matched)
+│ACCEPT/DROP  │
+└─────────────┘
+```
+
+---
+
+### 1.5 Targets/Actions (What To Do)
+
+**What:** The action to take when a rule matches.
+
+**Two categories:**
+
+| Type | Behavior | Examples |
+|------|----------|----------|
+| **Terminating** | Packet stops traversing the chain | ACCEPT, DROP, REJECT, DNAT, SNAT |
+| **Non-terminating** | Packet continues to next rule | LOG, MARK, RETURN |
+
+**Common targets:**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       COMMON TARGETS                            │
+├──────────────┬──────────────────────────────────────────────────┤
+│   Target     │   Effect                                         │
+├──────────────┼──────────────────────────────────────────────────┤
+│   ACCEPT     │ Allow packet through (stop processing chain)     │
+│   DROP       │ Silently discard packet                          │
+│   REJECT     │ Discard + send ICMP error back to sender         │
+│   LOG        │ Log to syslog, continue processing               │
+│   RETURN     │ Exit current chain, return to calling chain      │
+│   DNAT       │ Rewrite destination IP/port (nat table only)     │
+│   SNAT       │ Rewrite source IP (nat table only)               │
+│   MASQUERADE │ SNAT with dynamic source IP (nat table only)     │
+│   REDIRECT   │ Redirect to local port (nat table only)          │
+│   MARK       │ Set packet mark for policy routing               │
+│   <chain>    │ Jump to custom chain                             │
+└──────────────┴──────────────────────────────────────────────────┘
+```
+
+---
+
+## 2. Execution Order & Packet Flow
+
+### 2.1 Table-to-Chain Mapping
+
+Not all tables exist at all hooks. Here's what's available:
+
 
 ```
               PREROUTING    INPUT    FORWARD    OUTPUT    POSTROUTING
@@ -89,16 +242,154 @@ Not all tables have all chains. Here's what exists:
                                                     * nat INPUT added in newer kernels
 ```
 
-### Processing Order at Each Hook
+---
 
-When a packet hits a hook, tables are processed in this order:
+### 2.2 Complete Execution Timeline
+
+When a packet arrives, here's the EXACT order of processing:
 
 ```
-PREROUTING:  raw → mangle → nat
-INPUT:       mangle → filter → nat*
-FORWARD:     mangle → filter
-OUTPUT:      raw → mangle → nat → filter
-POSTROUTING: mangle → nat
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    PACKET PROCESSING TIMELINE                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+INCOMING PACKET HITS NIC
+         │
+         ▼
+═══════════════════════════════════════════════════════════════════════════════
+ HOOK: PREROUTING
+═══════════════════════════════════════════════════════════════════════════════
+         │
+         ├──▶ [1] raw    table → PREROUTING chain  (conntrack bypass)
+         ├──▶ [2] mangle table → PREROUTING chain  (packet modification)
+         ├──▶ [3] nat    table → PREROUTING chain  (DNAT happens here!)
+         │
+         ▼
+┌─────────────────────────┐
+│    ROUTING DECISION     │  Kernel decides: Is destination IP local or remote?
+└────────────┬────────────┘
+             │
+     ┌───────┴───────┐
+     │               │
+  LOCAL?          FORWARD?
+     │               │
+     ▼               ▼
+═══════════════  ═══════════════════════════════════════════════════════════════
+ HOOK: INPUT      HOOK: FORWARD
+═══════════════  ═══════════════════════════════════════════════════════════════
+     │               │
+     ├──▶ [4a]       ├──▶ [4b] mangle table → FORWARD chain
+     │   mangle      ├──▶ [5b] filter table → FORWARD chain  ←─ FIREWALL
+     ├──▶ [5a]       │
+     │   filter      │
+     │   ← FIREWALL  │
+     ├──▶ [6a]       │
+     │   nat*        │
+     │               │
+     ▼               │
+┌──────────────┐     │
+│Local Process │     │
+│(nginx, sshd) │     │
+└──────┬───────┘     │
+       │             │
+  (generates         │
+   response)         │
+       │             │
+       ▼             │
+═══════════════      │
+ HOOK: OUTPUT        │
+═══════════════      │
+       │             │
+       ├──▶ [7] raw    table → OUTPUT chain                    │
+       ├──▶ [8] mangle table → OUTPUT chain                    │
+       ├──▶ [9] nat    table → OUTPUT chain  (DNAT for local)  │
+       ├──▶ [10] filter table → OUTPUT chain  ←─ EGRESS CTRL   │
+       │             │
+       ▼             │
+┌──────────────┐     │
+│   ROUTING    │     │
+│   DECISION   │     │
+└──────┬───────┘     │
+       │             │
+       └──────┬──────┘
+              │
+              ▼
+═══════════════════════════════════════════════════════════════════════════════
+ HOOK: POSTROUTING
+═══════════════════════════════════════════════════════════════════════════════
+              │
+              ├──▶ [11] mangle table → POSTROUTING chain
+              ├──▶ [12] nat    table → POSTROUTING chain  (SNAT/MASQUERADE here!)
+              │
+              ▼
+         NIC (packet exits)
+```
+
+---
+
+### 2.3 Processing Order Summary
+
+**Per-hook table order:**
+
+| Hook | Tables (in order) |
+|------|-------------------|
+| PREROUTING | raw → mangle → nat |
+| INPUT | mangle → filter → nat* |
+| FORWARD | mangle → filter |
+| OUTPUT | raw → mangle → nat → filter |
+| POSTROUTING | mangle → nat |
+
+**Within each table's chain:**
+```
+Rule 1 → Rule 2 → Rule 3 → ... → Default Policy
+   ↓         ↓         ↓
+ match?   match?   match?
+```
+
+---
+
+### 2.4 The Three Packet Paths
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         PACKET PATH SUMMARY                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  PATH 1: INCOMING TO LOCAL SERVICE (e.g., SSH to this server)              │
+│  ─────────────────────────────────────────────────────────────              │
+│  NIC → PREROUTING → [routing: local] → INPUT → Local Process               │
+│                                                                             │
+│  PATH 2: FORWARDED/ROUTED (e.g., router/NAT gateway)                        │
+│  ───────────────────────────────────────────────────                        │
+│  NIC → PREROUTING → [routing: not local] → FORWARD → POSTROUTING → NIC     │
+│                                                                             │
+│  PATH 3: LOCALLY GENERATED (e.g., curl from this server)                    │
+│  ──────────────────────────────────────────────────────                     │
+│  Local Process → OUTPUT → [routing] → POSTROUTING → NIC                     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 2.5 Why This Order Matters (Practical Examples)
+
+**Example 1: DNAT must happen in PREROUTING**
+```
+Wrong:  Try to DNAT in INPUT   → Routing already decided, packet goes to local
+Right:  DNAT in PREROUTING     → Routing sees NEW destination, forwards correctly
+```
+
+**Example 2: SNAT must happen in POSTROUTING**
+```
+Wrong:  Try to SNAT in OUTPUT  → Routing hasn't finished, may break
+Right:  SNAT in POSTROUTING    → After routing, just before leaving NIC
+```
+
+**Example 3: Firewall rules go in filter table**
+```
+Wrong:  DROP in raw table      → Before conntrack, can't use -m conntrack
+Right:  DROP in filter table   → After conntrack, can match ESTABLISHED
 ```
 
 ---

@@ -1,21 +1,38 @@
-Packet Journey: Request and Response
-Follow a packet step-by-step through iptables, conntrack, and NAT
+# Packet Journey: Request and Response
+> Follow a packet step-by-step through iptables, conntrack, and NAT
 
-Table of Contents
-Scenario 1: Direct (No NAT) - M → W on the same LAN
-Scenario 2: SNAT/MASQUERADE - Internal host → Internet
-Scenario 3: DNAT (Port Forwarding) - Internet → Internal host
-Network Diagrams
-Scenario 1 — Direct
+## Table of Contents
+1. [Scenario 1: Direct (No NAT)](#scenario-1-direct-no-nat) - M → W on the same LAN
+2. [Scenario 2: SNAT/MASQUERADE](#scenario-2-snatmasquerade) - Internal host → Internet
+3. [Scenario 3: DNAT (Port Forwarding)](#scenario-3-dnat-port-forwarding) - Internet → Internal host
+
+---
+
+## Network Diagrams
+
+### Scenario 1 — Direct
+```
 M (192.168.11.104)  ◄──── LAN ────►  W (192.168.11.108)
-Scenarios 2 & 3 — NAT
+```
+
+### Scenarios 2 & 3 — NAT
+```
 Internal Host        NAT Gateway              Remote Server
 10.0.0.5        ──►  203.0.113.1  ──► Internet ──►  8.8.8.8
 (private)             (public)                       (public)
-Scenario 1: Direct (No NAT)
-Action: M (192.168.11.104) runs ssh ubuntu@192.168.11.108
+```
 
-REQUEST: M → W
+---
+
+## Scenario 1: Direct (No NAT)
+
+**Action:** M (192.168.11.104) runs `ssh ubuntu@192.168.11.108`
+
+---
+
+### REQUEST: M → W
+
+```
 M's Kernel (192.168.11.104)
 │
 │  Step 1: Application creates socket
@@ -65,7 +82,13 @@ W's Kernel (192.168.11.108)
 │  ✓ Match → packet accepted
 │
 │  Step 12: Packet delivered to sshd process on port 22
-RESPONSE: W → M
+```
+
+---
+
+### RESPONSE: W → M
+
+```
 W's Kernel (192.168.11.108)
 │
 │  Step 1: sshd sends SYN-ACK response
@@ -111,7 +134,13 @@ M's Kernel (192.168.11.104)
 │  Step 11: Packet delivered to ssh client
 │
 │  *** TCP handshake complete, SSH session active ***
-What happens WITHOUT the ESTABLISHED,RELATED rule on M?
+```
+
+---
+
+### What happens WITHOUT the ESTABLISHED,RELATED rule on M?
+
+```
 Step 10 FAILS:
   INPUT chain (M's iptables):
     Rule 1: -p tcp -s 192.168.11.50 --dport 22 -j ACCEPT
@@ -119,15 +148,26 @@ Step 10 FAILS:
     No more rules → Policy: DROP
     ✗ SYN-ACK dropped silently
     ✗ SSH hangs → "Connection timed out"
+```
+
 This is exactly the problem you hit earlier.
 
-Scenario 2: SNAT/MASQUERADE
-Action: Internal host (10.0.0.5) runs curl https://8.8.8.8
+---
 
-NAT Gateway rule:
+## Scenario 2: SNAT/MASQUERADE
 
+**Action:** Internal host (10.0.0.5) runs `curl https://8.8.8.8`
+
+**NAT Gateway rule:**
+```bash
 iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
-REQUEST: Internal → Internet
+```
+
+---
+
+### REQUEST: Internal → Internet
+
+```
 Internal Host (10.0.0.5)
 │
 │  Step 1: curl creates socket
@@ -186,7 +226,13 @@ NAT Gateway (10.0.0.1 internal / 203.0.113.1 public)
 │
 │  Step 11: Packet arrives at 8.8.8.8
 │  Server sees src=203.0.113.1 (has no idea about 10.0.0.5)
-RESPONSE: Internet → Internal
+```
+
+---
+
+### RESPONSE: Internet → Internal
+
+```
 Remote Server (8.8.8.8)
 │
 │  Step 1: Server sends SYN-ACK
@@ -227,7 +273,13 @@ NAT Gateway (203.0.113.1)
 │
 │  Step 8: Packet arrives at 10.0.0.5
 │  curl receives SYN-ACK from 8.8.8.8 → connection established
-Key Point: NAT Only Runs Once
+```
+
+---
+
+### Key Point: NAT Only Runs Once
+
+```
 Packet 1 (SYN):     NAT rule evaluated → conntrack entry created + rewritten
 Packet 2 (SYN-ACK): conntrack handles translation → NAT rule SKIPPED
 Packet 3 (ACK):     conntrack handles translation → NAT rule SKIPPED
@@ -237,14 +289,26 @@ Packet N:           conntrack handles translation → NAT rule SKIPPED
 
 NAT rules are only consulted for the FIRST packet.
 Every subsequent packet is translated using the stored conntrack tuples.
-Scenario 3: DNAT (Port Forwarding)
-Action: External client connects to the gateway's public IP on port 8080, forwarded to internal web server 10.0.0.5:80
+```
 
-NAT Gateway rules:
+---
 
+## Scenario 3: DNAT (Port Forwarding)
+
+**Action:** External client connects to the gateway's public IP on port 8080,
+forwarded to internal web server 10.0.0.5:80
+
+**NAT Gateway rules:**
+```bash
 iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 8080 -j DNAT --to 10.0.0.5:80
 iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
-REQUEST: Internet → Internal
+```
+
+---
+
+### REQUEST: Internet → Internal
+
+```
 External Client (1.2.3.4)
 │
 │  Step 1: Client connects to public IP
@@ -288,7 +352,13 @@ NAT Gateway (203.0.113.1)
 │
 │  Step 7: Packet arrives at 10.0.0.5:80
 │  Web server sees src=1.2.3.4 (knows the real client IP)
-RESPONSE: Internal → Internet
+```
+
+---
+
+### RESPONSE: Internal → Internet
+
+```
 Internal Web Server (10.0.0.5)
 │
 │  Step 1: Web server sends SYN-ACK
@@ -324,7 +394,13 @@ NAT Gateway
 │  Step 6: Packet arrives at 1.2.3.4
 │  Client sees response from 203.0.113.1:8080
 │  (has no idea about 10.0.0.5)
-Summary: Where Things Happen
+```
+
+---
+
+## Summary: Where Things Happen
+
+```
                         INCOMING PACKET
                               │
                               ▼
@@ -357,8 +433,10 @@ Summary: Where Things Happen
                   │
                   ▼
            Packet leaves
-The conntrack + NAT relationship:
-conntrack = the tracking system (always active, tracks ALL connections)
-NAT = a consumer of conntrack (modifies the reply tuple on first packet only)
-Same table = NAT doesn't have its own table, it reuses conntrack entries
-First packet only = NAT rules run once, conntrack handles every subsequent packet
+```
+
+### The conntrack + NAT relationship:
+- **conntrack** = the tracking system (always active, tracks ALL connections)
+- **NAT** = a consumer of conntrack (modifies the reply tuple on first packet only)
+- **Same table** = NAT doesn't have its own table, it reuses conntrack entries
+- **First packet only** = NAT rules run once, conntrack handles every subsequent packet

@@ -42,7 +42,7 @@ understanding from packet-journey.md.
           │                    │                     │
 ┌─────────┴───────────┐  ┌────┴────────────────┐  ┌─┴───────────────────┐
 │  M (NAT Gateway)    │  │  W (Internal Host)  │  │  Admin PC           │
-│  192.168.11.104     │  │  192.168.11.108     │  │  192.168.11.50      │
+│  192.168.11.109     │  │  192.168.11.110     │  │  192.168.11.50      │
 │                     │  │                     │  │  (always allowed)   │
 │  Roles:             │  │  Roles:             │  │                     │
 │  - NAT gateway      │  │  - Routes via M     │  │  - External client  │
@@ -52,14 +52,14 @@ understanding from packet-journey.md.
 ```
 
 **Convention:** Run commands on the host shown in the prompt:
-- `M#` = run on 192.168.11.104 (NAT gateway)
-- `W#` = run on 192.168.11.108 (internal host)
+- `M#` = run on 192.168.11.109 (NAT gateway)
+- `W#` = run on 192.168.11.110 (internal host)
 
 > **Before you start:** Check your interface name on both hosts:
 > ```bash
 > ip -br a
 > ```
-> Replace `ens18` in the examples below with your actual interface name.
+> Replace `eth0` in the examples below with your actual interface name.
 
 ---
 
@@ -143,18 +143,18 @@ ip_forward = 1:
 to its own address (MASQUERADE), making W invisible to the outside world.
 
 ```
-W (192.168.11.108)                  M (192.168.11.104)              Internet
+W (192.168.11.110)                  M (192.168.11.109)              Internet
        │                                   │                           │
-       │  src=.108  dst=8.8.8.8            │                           │
+       │  src=.110  dst=8.8.8.8            │                           │
        ├──────────────────────────────────► │                           │
        │                                   │  MASQUERADE               │
-       │                                   │  src=.104  dst=8.8.8.8   │
+       │                                   │  src=.109  dst=8.8.8.8   │
        │                                   ├─────────────────────────► │
        │                                   │                           │
-       │                                   │  src=8.8.8.8  dst=.104   │
+       │                                   │  src=8.8.8.8  dst=.109   │
        │                                   │ ◄─────────────────────────┤
        │                                   │  reverse-NAT              │
-       │  src=8.8.8.8  dst=.108            │                           │
+       │  src=8.8.8.8  dst=.110            │                           │
        │ ◄─────────────────────────────────┤                           │
 ```
 
@@ -164,21 +164,21 @@ Before changing anything, save W's current gateway so you can restore it later.
 
 ```bash
 W# ip route show default
-# Example output: default via 192.168.11.1 dev ens18 proto dhcp metric 100
+# Example output: default via 192.168.11.1 dev eth0 proto dhcp metric 100
 # ^^^ note this — you'll need it for cleanup
 ```
 
 ### Step 2 — Add MASQUERADE rule on M
 
 ```bash
-M# iptables -t nat -A POSTROUTING -s 192.168.11.108 -o ens18 -j MASQUERADE
+M# iptables -t nat -A POSTROUTING -s 192.168.11.110 -o eth0 -j MASQUERADE
 ```
 
 **Rule breakdown:**
 - `-t nat` — operate on the nat table
 - `-A POSTROUTING` — append to POSTROUTING chain (last hook before packet leaves)
-- `-s 192.168.11.108` — only NAT traffic from W
-- `-o ens18` — only when leaving via the outbound interface
+- `-s 192.168.11.110` — only NAT traffic from W
+- `-o eth0` — only when leaving via the outbound interface
 - `-j MASQUERADE` — rewrite source IP to M's interface IP
 
 ### Step 3 — Allow forwarding on M
@@ -187,10 +187,10 @@ M needs to allow W's traffic through the FORWARD chain:
 
 ```bash
 # Allow W's traffic to be forwarded out
-M# iptables -A FORWARD -s 192.168.11.108 -o ens18 -j ACCEPT
+M# iptables -A FORWARD -s 192.168.11.110 -o eth0 -j ACCEPT
 
 # Allow return traffic (responses) back to W
-M# iptables -A FORWARD -d 192.168.11.108 -m state --state ESTABLISHED,RELATED -j ACCEPT
+M# iptables -A FORWARD -d 192.168.11.110 -m state --state ESTABLISHED,RELATED -j ACCEPT
 ```
 
 **Concept:** MASQUERADE only rewrites the source IP — it doesn't bypass the
@@ -200,13 +200,13 @@ masqueraded but never leave (or return traffic never reaches W).
 ### Step 4 — Change W's default route to go through M
 
 ```bash
-W# ip route replace default via 192.168.11.104
+W# ip route replace default via 192.168.11.109
 ```
 
 **Verify:**
 ```bash
 W# ip route show default
-# Expected: default via 192.168.11.104 dev ens18
+# Expected: default via 192.168.11.109 dev eth0
 ```
 
 ### Step 5 — Test
@@ -219,14 +219,14 @@ W# curl -s --max-time 5 ifconfig.me
 
 **On M — watch the traffic (run BEFORE the test above):**
 ```bash
-M# tcpdump -ni ens18 host 8.8.8.8 -c 10
+M# tcpdump -ni eth0 host 8.8.8.8 -c 10
 ```
 
 **What you should see on tcpdump:**
 ```
-# Outbound: src is M's IP (.104), NOT W's IP (.108) — MASQUERADE worked!
-192.168.11.104 > 8.8.8.8: ICMP echo request
-8.8.8.8 > 192.168.11.104: ICMP echo reply
+# Outbound: src is M's IP (.109), NOT W's IP (.110) — MASQUERADE worked!
+192.168.11.109 > 8.8.8.8: ICMP echo request
+8.8.8.8 > 192.168.11.109: ICMP echo reply
 ```
 
 ### Step 6 — Inspect conntrack on M
@@ -237,12 +237,12 @@ M# conntrack -L | grep 8.8.8.8
 
 **Expected entry (simplified):**
 ```
-icmp  1 src=192.168.11.108 dst=8.8.8.8     [UNREPLIED]
-          src=8.8.8.8     dst=192.168.11.104           ← reply tuple rewritten!
+icmp  1 src=192.168.11.110 dst=8.8.8.8     [UNREPLIED]
+          src=8.8.8.8     dst=192.168.11.109           ← reply tuple rewritten!
 ```
 
-Notice: the **Original** tuple has W's real IP (.108), but the **Reply** tuple
-has M's IP (.104). This is how conntrack knows to reverse the NAT on return packets.
+Notice: the **Original** tuple has W's real IP (.110), but the **Reply** tuple
+has M's IP (.109). This is how conntrack knows to reverse the NAT on return packets.
 
 ### Step 7 — Verify the nat table counters
 
@@ -255,19 +255,19 @@ M# iptables -t nat -L POSTROUTING -v -n
 **Concept recap — what happened step by step:**
 
 ```
-1. W sends packet: src=.108 dst=8.8.8.8
-2. W's routing: default via .104 → sends to M
-3. M receives packet on ens18
+1. W sends packet: src=.110 dst=8.8.8.8
+2. W's routing: default via .109 → sends to M
+3. M receives packet on eth0
 4. M: PREROUTING → no DNAT rules → pass
 5. M: routing decision → dst is NOT local → FORWARD chain
-6. M: FORWARD → rule matches src=.108 → ACCEPT
-7. M: POSTROUTING → MASQUERADE → src rewritten to .104
-8. M: conntrack creates entry mapping .108 ↔ .104
-9. Packet leaves M as src=.104 dst=8.8.8.8
-10. Reply arrives: src=8.8.8.8 dst=.104
-11. M: conntrack matches reply tuple → reverse NAT → dst becomes .108
+6. M: FORWARD → rule matches src=.110 → ACCEPT
+7. M: POSTROUTING → MASQUERADE → src rewritten to .109
+8. M: conntrack creates entry mapping .110 ↔ .109
+9. Packet leaves M as src=.109 dst=8.8.8.8
+10. Reply arrives: src=8.8.8.8 dst=.109
+11. M: conntrack matches reply tuple → reverse NAT → dst becomes .110
 12. M: FORWARD → ESTABLISHED,RELATED → ACCEPT
-13. Packet delivered to W as src=8.8.8.8 dst=.108
+13. Packet delivered to W as src=8.8.8.8 dst=.110
 ```
 
 > See [packet-journey.md — Scenario 2](packet-journey.md#scenario-2-snatmasquerade)
@@ -284,8 +284,8 @@ is subtle but important for production.
 
 ```bash
 # Replace the MASQUERADE rule with explicit SNAT
-M# iptables -t nat -D POSTROUTING -s 192.168.11.108 -o ens18 -j MASQUERADE
-M# iptables -t nat -A POSTROUTING -s 192.168.11.108 -o ens18 -j SNAT --to-source 192.168.11.104
+M# iptables -t nat -D POSTROUTING -s 192.168.11.110 -o eth0 -j MASQUERADE
+M# iptables -t nat -A POSTROUTING -s 192.168.11.110 -o eth0 -j SNAT --to-source 192.168.11.109
 ```
 
 **Test (same as before):**
@@ -324,7 +324,7 @@ Works the same. So what's the difference?
 
 ```bash
 M# iptables -t nat -F POSTROUTING
-M# iptables -t nat -A POSTROUTING -s 192.168.11.108 -o ens18 -j MASQUERADE
+M# iptables -t nat -A POSTROUTING -s 192.168.11.110 -o eth0 -j MASQUERADE
 ```
 
 ---
@@ -335,62 +335,85 @@ M# iptables -t nat -A POSTROUTING -s 192.168.11.108 -o ens18 -j MASQUERADE
 to W's web server on port 80.
 
 ```
-Admin PC (.50)           M (.104)                  W (.108)
+Admin PC (.50)           M (.109)                  W (.110)
     │                       │                         │
-    │  dst=.104:8080        │                         │
+    │  dst=.109:8080        │                         │
     ├──────────────────────►│                         │
     │                       │  DNAT                   │
-    │                       │  dst→.108:80            │
+    │                       │  dst→.110:80            │
     │                       ├────────────────────────►│
     │                       │                         │  nginx responds
     │                       │  reverse-NAT            │
     │                       │◄────────────────────────┤
-    │  src=.104:8080        │                         │
+    │  src=.109:8080        │                         │
     │◄──────────────────────┤                         │
 ```
 
 ### Step 1 — Start a web server on W
 
 ```bash
-W# echo "Hello from W ($(hostname))" > /tmp/index.html
-W# cd /tmp && python3 -m http.server 80 &
+W# cat > /tmp/web.py << 'EOF'
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import socket
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        srv_ip, srv_port = self.server.server_address
+        cli_ip, cli_port = self.client_address
+        body = (
+            f"Hello from W ({socket.gethostname()})\n"
+            f"  Server: {srv_ip}:{srv_port}\n"
+            f"  Client: {cli_ip}:{cli_port}\n"
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(body.encode())
+    def log_message(self, *a): pass
+
+HTTPServer(("0.0.0.0", 80), Handler).serve_forever()
+EOF
+W# python3 /tmp/web.py &
 ```
 
 **Verify locally:**
 ```bash
 W# curl -s http://127.0.0.1
-# Expected: Hello from W (...)
+# Expected:
+# Hello from W (...)
+#   Server: 0.0.0.0:80
+#   Client: 127.0.0.1:<port>
 ```
 
 ### Step 2 — Add DNAT rule on M
 
 ```bash
-M# iptables -t nat -A PREROUTING -i ens18 -p tcp --dport 8080 \
-   -j DNAT --to-destination 192.168.11.108:80
+M# iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 8080 \
+   -j DNAT --to-destination 192.168.11.110:80
 ```
 
 **Rule breakdown:**
 - `-t nat -A PREROUTING` — rewrite destination BEFORE routing decision
-- `-i ens18` — only for traffic arriving on the external interface
+- `-i eth0` — only for traffic arriving on the external interface
 - `-p tcp --dport 8080` — match TCP port 8080
-- `-j DNAT --to-destination 192.168.11.108:80` — rewrite dest to W:80
+- `-j DNAT --to-destination 192.168.11.110:80` — rewrite dest to W:80
 
 **Why PREROUTING?** The routing decision comes AFTER PREROUTING. If we don't
-rewrite the destination first, the kernel sees dst=.104 (local) and sends the
+rewrite the destination first, the kernel sees dst=.109 (local) and sends the
 packet to INPUT — never reaches FORWARD.
 
 ```
 Without DNAT in PREROUTING:
-  Packet dst=.104:8080 → routing: "that's me" → INPUT → no service on 8080 → RST
+  Packet dst=.109:8080 → routing: "that's me" → INPUT → no service on 8080 → RST
 
 With DNAT in PREROUTING:
-  Packet dst=.104:8080 → DNAT: dst→.108:80 → routing: "not me" → FORWARD → W
+  Packet dst=.109:8080 → DNAT: dst→.110:80 → routing: "not me" → FORWARD → W
 ```
 
 ### Step 3 — Allow forwarded DNAT traffic
 
 ```bash
-M# iptables -A FORWARD -p tcp -d 192.168.11.108 --dport 80 \
+M# iptables -A FORWARD -p tcp -d 192.168.11.110 --dport 80 \
    -m state --state NEW -j ACCEPT
 ```
 
@@ -404,7 +427,7 @@ M# iptables -A FORWARD -p tcp -d 192.168.11.108 --dport 80 \
 
 ```bash
 # From Admin PC (192.168.11.50):
-curl -s http://192.168.11.104:8080
+curl -s http://192.168.11.109:8080
 ```
 
 **Expected:** `Hello from W (...)`
@@ -419,15 +442,15 @@ Open two terminals on M:
 
 ```bash
 # Terminal 1: watch incoming traffic
-M# tcpdump -ni ens18 port 8080 -c 4
+M# tcpdump -ni eth0 port 8080 -c 4
 
 # Terminal 2: watch forwarded traffic toward W
-M# tcpdump -ni ens18 host 192.168.11.108 and port 80 -c 4
+M# tcpdump -ni eth0 host 192.168.11.110 and port 80 -c 4
 ```
 
 **Now curl from admin PC.** You should see:
-- Terminal 1: `192.168.11.50 > 192.168.11.104.8080`
-- Terminal 2: `192.168.11.50 > 192.168.11.108.80` (DNAT applied)
+- Terminal 1: `192.168.11.50 > 192.168.11.109.8080`
+- Terminal 2: `192.168.11.50 > 192.168.11.110.80` (DNAT applied)
 
 ### Step 6 — Inspect conntrack
 
@@ -437,8 +460,8 @@ M# conntrack -L | grep 8080
 
 **Expected (simplified):**
 ```
-tcp  6 ESTABLISHED src=192.168.11.50 dst=192.168.11.104 sport=XXXXX dport=8080
-                   src=192.168.11.108 dst=192.168.11.50 sport=80 dport=XXXXX
+tcp  6 ESTABLISHED src=192.168.11.50 dst=192.168.11.109 sport=XXXXX dport=8080
+                   src=192.168.11.110 dst=192.168.11.50 sport=80 dport=XXXXX
 ```
 
 The conntrack entry shows both the original (what the client sent) and reply
@@ -456,19 +479,19 @@ When the client, the gateway, and the backend are **all on the same subnet**,
 DNAT alone breaks. Here's why:
 
 ```
-Step 1: Admin (.50) sends to M (.104):8080
-        src=.50  dst=.104:8080
+Step 1: Admin (.50) sends to M (.109):8080
+        src=.50  dst=.109:8080
 
-Step 2: M DNATs: dst → .108:80, forwards to W
-        src=.50  dst=.108:80        ← source is still .50!
+Step 2: M DNATs: dst → .110:80, forwards to W
+        src=.50  dst=.110:80        ← source is still .50!
 
 Step 3: W receives packet, sees src=.50
         W checks routing: .50 is on my LAN, I know its MAC
         W responds DIRECTLY to .50 (bypasses M entirely!)
-        src=.108:80  dst=.50
+        src=.110:80  dst=.50
 
-Step 4: Admin PC receives packet from .108:80
-        But it's expecting a response from .104:8080!
+Step 4: Admin PC receives packet from .110:80
+        But it's expecting a response from .109:8080!
         → TCP RST or silently dropped
         → Connection hangs or fails
 ```
@@ -476,13 +499,13 @@ Step 4: Admin PC receives packet from .108:80
 ```
                 BROKEN — asymmetric routing
 
-Admin (.50)             M (.104)              W (.108)
+Admin (.50)             M (.109)              W (.110)
     │                       │                     │
     │──── SYN ─────────────►│                     │
     │                       │──── DNAT'd SYN ────►│
     │                       │                     │
     │◄──── SYN-ACK directly from W ───────────────│  ← WRONG!
-    │   (src=.108:80, but expected .104:8080)     │
+    │   (src=.110:80, but expected .109:8080)     │
     │                                             │
     │   TCP mismatch → connection fails           │
 ```
@@ -493,7 +516,7 @@ Make M also rewrite the **source IP** of DNAT'd packets, so W sees M as
 the client and responds back through M:
 
 ```bash
-M# iptables -t nat -A POSTROUTING -d 192.168.11.108 -p tcp --dport 80 \
+M# iptables -t nat -A POSTROUTING -d 192.168.11.110 -p tcp --dport 80 \
    -j MASQUERADE
 ```
 
@@ -502,18 +525,18 @@ M# iptables -t nat -A POSTROUTING -d 192.168.11.108 -p tcp --dport 80 \
 ```
                 FIXED — symmetric routing
 
-Admin (.50)             M (.104)              W (.108)
+Admin (.50)             M (.109)              W (.110)
     │                       │                     │
     │──── SYN ─────────────►│                     │
-    │   dst=.104:8080       │                     │
+    │   dst=.109:8080       │                     │
     │                       │──── DNAT+SNAT ─────►│
-    │                       │  src=.104 dst=.108  │  ← W sees M as client
+    │                       │  src=.109 dst=.110  │  ← W sees M as client
     │                       │                     │
     │                       │◄── response ────────│
-    │                       │  src=.108 dst=.104  │  ← W responds to M
+    │                       │  src=.110 dst=.109  │  ← W responds to M
     │                       │                     │
     │◄── reverse NAT ───────│                     │
-    │  src=.104:8080        │                     │  ← Admin sees M:8080
+    │  src=.109:8080        │                     │  ← Admin sees M:8080
 ```
 
 ### When you DON'T need this fix
@@ -538,7 +561,7 @@ Client (1.2.3.4)  →  Gateway (203.0.113.1:8080)  →  Backend (10.0.0.5:80)
 │  Pros                          │  Cons                              │
 ├────────────────────────────────┼────────────────────────────────────┤
 │  Works on any topology         │  Backend loses real client IP      │
-│  (same subnet, cross-subnet)   │  (W sees .104, not .50)           │
+│  (same subnet, cross-subnet)   │  (W sees .109, not .50)           │
 │                                │                                    │
 │  No asymmetric routing         │  All traffic flows through M      │
 │                                │  (potential bottleneck)            │
@@ -589,17 +612,17 @@ iptables -A INPUT -p tcp -s 192.168.11.50 --dport 22 -j ACCEPT
 
 # ── 7. FORWARD rules ──
 # Allow W's outbound traffic
-iptables -A FORWARD -s 192.168.11.108 -o ens18 -j ACCEPT
+iptables -A FORWARD -s 192.168.11.110 -o eth0 -j ACCEPT
 # Allow DNAT'd traffic to W's web server
-iptables -A FORWARD -p tcp -d 192.168.11.108 --dport 80 -m state --state NEW -j ACCEPT
+iptables -A FORWARD -p tcp -d 192.168.11.110 --dport 80 -m state --state NEW -j ACCEPT
 
 # ── 8. NAT rules ──
 # MASQUERADE: W's outbound traffic (SNAT)
-iptables -t nat -A POSTROUTING -s 192.168.11.108 -o ens18 -j MASQUERADE
+iptables -t nat -A POSTROUTING -s 192.168.11.110 -o eth0 -j MASQUERADE
 # DNAT: port forward 8080 → W:80
-iptables -t nat -A PREROUTING -i ens18 -p tcp --dport 8080 -j DNAT --to-destination 192.168.11.108:80
+iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 8080 -j DNAT --to-destination 192.168.11.110:80
 # Hairpin: SNAT for same-subnet DNAT (fixes return path)
-iptables -t nat -A POSTROUTING -d 192.168.11.108 -p tcp --dport 80 -j MASQUERADE
+iptables -t nat -A POSTROUTING -d 192.168.11.110 -p tcp --dport 80 -j MASQUERADE
 
 # ── 9. Logging (optional) ──
 iptables -A INPUT -j LOG --log-prefix "GW-INPUT-DROP: " --log-level 4
@@ -677,13 +700,13 @@ conntrack -L 2>/dev/null | awk '{print $4}' | sort | uniq -c | sort -rn
 **tcpdump at each hop (run on M):**
 ```bash
 # What arrives from the client?
-tcpdump -ni ens18 port 8080
+tcpdump -ni eth0 port 8080
 
 # What gets forwarded to backend?
-tcpdump -ni ens18 host 192.168.11.108 and port 80
+tcpdump -ni eth0 host 192.168.11.110 and port 80
 
 # What returns from backend?
-tcpdump -ni ens18 src 192.168.11.108 and port 80
+tcpdump -ni eth0 src 192.168.11.110 and port 80
 ```
 
 **Trace packets through iptables (heavy, use briefly):**
@@ -706,6 +729,7 @@ iptables -t raw -F
 | W can't reach internet | ip_forward=0 | `sysctl -w net.ipv4.ip_forward=1` |
 | W can't reach internet | No FORWARD rule | Add `-A FORWARD -s W -j ACCEPT` |
 | W can't reach internet | No MASQUERADE | Add POSTROUTING MASQUERADE rule |
+| DNAT not working | No DNAT rule | Add PREROUTING DNAT rule |
 | DNAT not working | FORWARD blocks it | Add FORWARD rule for DNAT'd dst |
 | DNAT works for some clients, not others | Same-subnet return path | Add MASQUERADE for DNAT'd traffic |
 | conntrack shows entries but traffic dies | MTU/fragmentation | Check `tcpdump` for ICMP "need frag" |
@@ -736,10 +760,10 @@ M# sysctl -w net.ipv4.ip_forward=1
 ```bash
 M# iptables -t nat -F POSTROUTING
 # Test: W# ping 8.8.8.8 → no response
-#   Why? 8.8.8.8 receives src=192.168.11.108 (private IP)
+#   Why? 8.8.8.8 receives src=192.168.11.110 (private IP)
 #   It has no route back to a private IP → response discarded
 # Fix:
-M# iptables -t nat -A POSTROUTING -s 192.168.11.108 -o ens18 -j MASQUERADE
+M# iptables -t nat -A POSTROUTING -s 192.168.11.110 -o eth0 -j MASQUERADE
 ```
 
 ---
@@ -773,16 +797,16 @@ W# ping -c 2 8.8.8.8
 
 **On M:**
 ```bash
-M# iptables -F
-M# iptables -X
-M# iptables -t nat -F
-M# iptables -t nat -X
-M# iptables -t mangle -F
-M# iptables -t raw -F
-M# iptables -P INPUT ACCEPT
-M# iptables -P FORWARD ACCEPT
-M# iptables -P OUTPUT ACCEPT
-M# sysctl -w net.ipv4.ip_forward=0
+iptables -F
+iptables -X
+iptables -t nat -F
+iptables -t nat -X
+iptables -t mangle -F
+iptables -t raw -F
+iptables -P INPUT ACCEPT
+iptables -P FORWARD ACCEPT
+iptables -P OUTPUT ACCEPT
+sysctl -w net.ipv4.ip_forward=0
 ```
 
 **On W:**

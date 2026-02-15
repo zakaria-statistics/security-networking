@@ -252,6 +252,17 @@ Compare with iptables:
   iptables equivalent = no ESTABLISHED,RELATED rule
   Every packet evaluated independently, no conntrack
 ```
+Equivalent iptables rules:
+
+```
+# 1. Allow the Inbound Request (SYN)
+iptables -A INPUT -p tcp -s 0.0.0.0/0 --dport 80 -j ACCEPT
+
+# 2. Allow the Outbound Response (SYN-ACK / DATA)
+# Without 'ESTABLISHED', you must open the entire ephemeral range
+iptables -A OUTPUT -p tcp -d 0.0.0.0/0 --sport 80 --dport 1024:65535 -j ACCEPT
+
+```
 
 **2. Numbered rules, first-match-wins**
 
@@ -381,7 +392,8 @@ Scenario 5 is the sneaky one:
   - Inbound SYN arrives → NACL allows → SG allows → iptables allows → SYN-ACK generated
   - SYN-ACK leaves VM → iptables allows → SG allows (stateful, auto) → NACL BLOCKS
   - NACL is stateless! Outbound ephemeral port rule was missing.
-  - SG's stateful nature doesn't help — NACL already dropped it before SG sees it.
+  - SG DID allow it (stateful, saw it second-to-last) — but NACL sits AFTER SG
+    on the outbound path and dropped it anyway. SG can't override NACL.
 ```
 
 ### Packet flow through all layers
@@ -584,6 +596,72 @@ iptables -A OUTPUT -j LOG --log-prefix "EGRESS-DROP: "
 
 # Now: no SSH outbound, no arbitrary ports, no data exfiltration
 # Any unexpected outbound is logged
+```
+
+### How rules are evaluated — comparison across all layers
+
+```
+┌────────────────────┬──────────────┬──────────────────┬──────────────────┐
+│                    │ NACL (AWS)   │ Security Group   │ iptables         │
+├────────────────────┼──────────────┼──────────────────┼──────────────────┤
+│ Evaluation order   │ By rule      │ ALL rules        │ Top-down,        │
+│                    │ number,      │ evaluated,       │ first match      │
+│                    │ lowest first │ no ordering      │ wins             │
+│                    │              │                  │                  │
+│ Match behavior     │ First match  │ Union (OR):      │ First match      │
+│                    │ wins, stop   │ if ANY rule      │ wins, stop       │
+│                    │              │ allows → allow   │                  │
+│                    │              │                  │                  │
+│ Can deny?          │ YES          │ NO (allow-only)  │ YES              │
+│                    │ explicit     │ implicit deny    │ explicit DROP    │
+│                    │ DENY rules   │ if no rule       │ or policy DROP   │
+│                    │              │ matches          │                  │
+│                    │              │                  │                  │
+│ Overlapping rules  │ Specific     │ All combined:    │ Specific rule    │
+│ example:           │ deny beats   │ allow 80 from A  │ higher in chain  │
+│                    │ broad allow  │ + allow 80 from B│ wins over lower  │
+│                    │ IF numbered  │ = allow from     │ rule             │
+│                    │ lower        │ A and B          │                  │
+│                    │              │                  │                  │
+│ Default (no match) │ Implicit     │ Implicit         │ Chain policy     │
+│                    │ DENY (rule *) │ DENY all inbound│ (ACCEPT or DROP) │
+│                    │              │ ALLOW all outbound│                 │
+└────────────────────┴──────────────┴──────────────────┴──────────────────┘
+```
+
+**Walk-through: packet to 198.51.100.5:443 with the NACL rules above:**
+
+```
+NACL (first-match-wins by rule number):
+  Rule 50:  DENY ALL to 198.51.100.0/24  → dest matches → DENY → STOP
+  Rule 100: ALLOW TCP 443 to 0.0.0.0/0   → never reached
+  Result: BLOCKED
+
+  0.0.0.0/0 includes 198.51.100.0/24, but rule 50 fires first.
+  To override a deny, you'd need a lower-numbered allow rule (e.g., rule 40).
+
+Security Group (same packet, if it were SG rules instead):
+  Rule: Allow TCP 443 to 0.0.0.0/0       → matches → ALLOW
+  (no deny rules exist in SGs)
+  Result: ALLOWED — SGs can't block a specific IP within an allowed range
+
+iptables (same packet):
+  Rule 1: -A OUTPUT -d 198.51.100.0/24 -j DROP   → matches → DROP → STOP
+  Rule 2: -A OUTPUT -p tcp --dport 443 -j ACCEPT  → never reached
+  Result: BLOCKED — same first-match-wins as NACL
+  To override: move the ACCEPT above the DROP, or use -I to insert at top
+```
+
+**Azure NSGs — same model for both subnet and NIC level:**
+```
+Azure NSGs use PRIORITY numbers (lower = evaluated first), like NACLs:
+  Priority 100: Allow TCP 443 from *        → checked first
+  Priority 200: Deny  ALL from 10.0.0.5     → checked second
+  Priority 65000+: Azure default rules      → checked last
+
+Unlike AWS SGs (allow-only), Azure NSGs support both allow AND deny.
+Unlike AWS NACLs (stateless), Azure NSGs are stateful.
+So Azure NSG = hybrid: deny capability like NACLs + stateful like SGs.
 ```
 
 ---

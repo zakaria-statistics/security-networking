@@ -143,6 +143,71 @@ Meaning 3 — Physical socket
   "CPU socket" — the slot on the motherboard. Nothing to do with networking.
 ```
 
+### How apps connect to the network (socket syscalls)
+
+```
+Sockets are the API boundary between your app and the kernel's network stack.
+Apps never touch packets, Ethernet frames, or IP headers directly.
+They talk to the kernel through system calls (syscalls), and the kernel
+handles TCP/IP, routing, iptables, and NIC transmission.
+
+Your app (nginx, python, redis...)
+    │
+    │  socket() → bind() → listen() → accept() → read()/write()
+    │
+    ▼
+Kernel network stack
+    │  TCP/IP processing, conntrack, iptables rules, routing table
+    ▼
+Network interface (eth0, lo, veth...)
+    │
+    ▼
+Wire / virtual link
+
+The syscall sequence for a SERVER (listening for connections):
+
+  1. socket(AF_INET, SOCK_STREAM, 0)
+     → "Create a TCP communication endpoint"
+     → Returns a file descriptor (fd), e.g., fd=3
+
+  2. bind(fd, "0.0.0.0", 80)
+     → "Attach this socket to address 0.0.0.0 port 80"
+     → THIS is where the bind address is decided
+     → The app chooses 0.0.0.0 (all interfaces) or 127.0.0.1 (loopback)
+
+  3. listen(fd, backlog=128)
+     → "Start accepting incoming connections (queue up to 128)"
+     → Socket moves to LISTEN state
+     → Now visible in: ss -tlnp
+
+  4. accept(fd)
+     → "Wait for a client to connect, return a NEW socket for that client"
+     → Returns a new fd for each connection (e.g., fd=4, fd=5...)
+     → Original fd=3 keeps listening
+
+  5. read(client_fd) / write(client_fd)
+     → "Send and receive data on this connection"
+     → App reads/writes bytes — kernel handles TCP segmentation,
+       IP routing, checksums, retransmission, everything
+
+The syscall sequence for a CLIENT (connecting to a server):
+
+  1. socket(AF_INET, SOCK_STREAM, 0)     → create endpoint
+  2. connect(fd, "93.184.216.34", 80)     → TCP handshake (SYN/SYN-ACK/ACK)
+     → kernel picks a random source port (ephemeral, 1024-65535)
+  3. write(fd, "GET / HTTP/1.1\r\n...")   → send request
+  4. read(fd)                              → receive response
+
+That's why ss -tlnp works:
+  It reads the kernel's socket table — the list of all sockets created
+  by all processes. Each entry shows which process bound to which address:port.
+
+  ss -tlnp output:
+  State   Local Address:Port   Process
+  LISTEN  0.0.0.0:80           nginx      ← bind("0.0.0.0", 80) was called
+  LISTEN  127.0.0.1:5432       postgres   ← bind("127.0.0.1", 5432) was called
+```
+
 ### Quick disambiguation
 
 ```
@@ -453,6 +518,49 @@ In routing:
 In iptables:
   -s 0.0.0.0/0 = "any source" (usually omitted, it's the default)
   -d 0.0.0.0/0 = "any destination"
+```
+
+### Bind address — who decides it?
+
+```
+The bind address is set by the APPLICATION, not by the network layer.
+It's in the app's config file or source code — not iptables, not NSG, not routing.
+
+nginx:
+  listen 80;                → binds 0.0.0.0:80 (all interfaces, external OK)
+  listen 127.0.0.1:80;      → binds loopback only (local only)
+
+python:
+  HTTPServer(("0.0.0.0", 80), Handler)    → all interfaces
+  HTTPServer(("127.0.0.1", 80), Handler)  → loopback only
+
+node.js:
+  app.listen(3000, "0.0.0.0")   → all interfaces
+  app.listen(3000)               → often loopback by default (version-dependent)
+
+postgresql:
+  listen_addresses = '*'         → all interfaces (in postgresql.conf)
+  listen_addresses = 'localhost' → loopback only (default)
+
+redis:
+  bind 127.0.0.1                → loopback only (default, secure)
+  bind 0.0.0.0                  → all interfaces (opens to network)
+```
+
+```
+Common cloud debugging trap:
+
+  SG / NSG: allows port 5432          ✓
+  iptables: no DROP rule              ✓
+  postgresql: listen_addresses = 'localhost'  ✗ ← app only listens on loopback
+
+  Result: "connection refused" from outside, works with psql locally.
+  No firewall is blocking it — the app simply isn't listening on the external interface.
+
+How to check:
+  ss -tlnp | grep :5432
+  → 127.0.0.1:5432    ← problem: loopback only
+  → 0.0.0.0:5432      ← correct: all interfaces
 ```
 
 ---

@@ -130,7 +130,7 @@ az network nsg create \
   --name "$NSG_NIC" \
   --output none
 
-# Allow SSH
+# Allow SSH Inbound
 az network nsg rule create \
   --resource-group "$RG" \
   --nsg-name "$NSG_NIC" \
@@ -143,7 +143,7 @@ az network nsg rule create \
   --source-address-prefixes '*' \
   --output none
 
-# Allow HTTP
+# Allow HTTP Inbound
 az network nsg rule create \
   --resource-group "$RG" \
   --nsg-name "$NSG_NIC" \
@@ -165,7 +165,7 @@ az network public-ip create \
   --allocation-method Static \
   --output none
 
-# ── Step 7: NIC with NSG attached ──
+# ── Step 7: NIC with NSG attached and attached PIP ──
 echo "[7/9] Creating NIC with NSG attached..."
 az network nic create \
   --resource-group "$RG" \
@@ -176,7 +176,7 @@ az network nic create \
   --public-ip-address "${VM_NAME}-pip" \
   --output none
 
-# ── Step 8: VM ──
+# ── Step 8: VM with attached NIC ──
 echo "[8/9] Creating VM (this takes ~60 seconds)..."
 az vm create \
   --resource-group "$RG" \
@@ -186,8 +186,8 @@ az vm create \
   --size "$VM_SIZE" \
   --admin-username "$ADMIN_USER" \
   --generate-ssh-keys \
-  --custom-data @- <<'CLOUD_INIT' \
-  --output none
+  --output none \
+  --custom-data @- <<'CLOUD_INIT'
 #!/bin/bash
 apt-get update -qq
 apt-get install -y -qq nginx conntrack iptables > /dev/null 2>&1

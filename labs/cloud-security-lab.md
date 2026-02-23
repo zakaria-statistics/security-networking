@@ -926,13 +926,13 @@ protects the VM even if NSG rules are misconfigured.
 local$ ssh azurelab@$VM_IP
 
 # Build the golden image firewall
-vm# sudo iptables -F
-vm# sudo iptables -A INPUT -i lo -j ACCEPT
-vm# sudo iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-vm# sudo iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-vm# sudo iptables -A INPUT -p tcp --dport 80 -j ACCEPT
-vm# sudo iptables -A INPUT -j LOG --log-prefix "GOLD-DROP: " --log-level 4
-vm# sudo iptables -P INPUT DROP
+sudo iptables -F
+sudo iptables -A INPUT -i lo -j ACCEPT
+sudo iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+sudo iptables -A INPUT -j LOG --log-prefix "GOLD-DROP: " --log-level 4
+sudo iptables -P INPUT DROP
 
 # Verify:
 vm# sudo iptables -L INPUT -v -n --line-numbers
@@ -940,18 +940,42 @@ vm# sudo iptables -L INPUT -v -n --line-numbers
 
 **Test — all layers aligned:**
 ```bash
+# Ensure VM_IP is still set (re-export if you opened a new terminal)
+local$ export VM_IP=$(az network public-ip show \
+  --resource-group cloud-sec-lab \
+  --name web-vm-pip \
+  --query ipAddress -o tsv)
+
 local$ curl -s http://$VM_IP              # Works (80 allowed everywhere)
 local$ ssh azurelab@$VM_IP                 # Works (22 allowed everywhere)
 local$ nc -zv -w3 $VM_IP 3306             # BLOCKED
 ```
 
-**Now simulate an NSG misconfiguration — open ALL ports at NIC level:**
+**Now simulate an NSG misconfiguration — open ALL ports at both NSG levels:**
 ```bash
+local$ DANGEROUS_RULE="DANGEROUS_AllowAll"
+
+# Step 1: Allow 3306 through subnet NSG (first gate)
+# Without this, nsg-subnet's default DenyAllInBound (pri=65500) drops the
+# packet before it ever reaches nsg-nic or iptables.
+local$ az network nsg rule create \
+  --resource-group cloud-sec-lab \
+  --nsg-name nsg-subnet \
+  --name Allow3306-Subnet \
+  --priority 150 \
+  --direction Inbound \
+  --access Allow \
+  --protocol Tcp \
+  --destination-port-ranges 3306 \
+  --source-address-prefixes '*' \
+  --output none
+
+# Step 2: Misconfigure NIC NSG — open everything
 local$ az network nsg rule create \
   --resource-group cloud-sec-lab \
   --nsg-name nsg-nic \
-  --name DANGEROUS_AllowAll \
-  --priority 100 \
+  --name $DANGEROUS_RULE \
+  --priority 150 \
   --direction Inbound \
   --access Allow \
   --protocol '*' \
@@ -962,6 +986,7 @@ local$ az network nsg rule create \
 # Try to reach a dangerous port:
 local$ nc -zv -w3 $VM_IP 3306
 # BLOCKED — iptables golden image saved us!
+# (both NSGs now pass it through, but iptables drops it inside the VM)
 
 # Check the log inside the VM:
 vm# sudo dmesg | grep GOLD-DROP | tail -3
@@ -971,11 +996,9 @@ vm# sudo dmesg | grep GOLD-DROP | tail -3
 **This is defense-in-depth in action:**
 ```
 Packet to port 3306:
-  nsg-subnet: AllowSSH(22), AllowHTTP(80)... no rule for 3306
-              BUT Azure default rules at 65000 allow VNet traffic
-              → depends on source
+  nsg-subnet: Allow3306-Subnet pri=150 → ALLOW ← intentionally opened for test
 
-  nsg-nic:    DANGEROUS_AllowAll pri=100 → ALLOW ← misconfigured!
+  nsg-nic:    DANGEROUS_AllowAll pri=150 → ALLOW ← misconfigured!
 
   iptables:   no rule for 3306 → LOG → DROP ← golden image saves us!
 ```
@@ -985,7 +1008,14 @@ Packet to port 3306:
 local$ az network nsg rule delete \
   --resource-group cloud-sec-lab \
   --nsg-name nsg-nic \
-  --name DANGEROUS_AllowAll
+  --name $DANGEROUS_RULE \
+  --yes
+
+local$ az network nsg rule delete \
+  --resource-group cloud-sec-lab \
+  --nsg-name nsg-subnet \
+  --name Allow3306-Subnet \
+  --yes
 ```
 
 ---
@@ -1024,12 +1054,14 @@ local$ az network nsg rule delete \
 
 **Layer 3 — iptables egress control (more granular):**
 ```bash
-vm# sudo iptables -P OUTPUT DROP
-vm# sudo iptables -A OUTPUT -o lo -j ACCEPT
-vm# sudo iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-vm# sudo iptables -A OUTPUT -p udp --dport 53 -j ACCEPT     # DNS
-vm# sudo iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT    # HTTPS only
-vm# sudo iptables -A OUTPUT -j LOG --log-prefix "EGRESS-DROP: "
+# Add allow rules BEFORE setting DROP policy — order matters to avoid self-lockout
+sudo iptables -A OUTPUT -o lo -j ACCEPT
+sudo iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT  # keeps SSH alive
+sudo iptables -A OUTPUT -p tcp --sport 22 -j ACCEPT     # SSH responses out
+sudo iptables -A OUTPUT -p udp --dport 53 -j ACCEPT     # DNS
+sudo iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT    # HTTPS only
+sudo iptables -A OUTPUT -j LOG --log-prefix "EGRESS-DROP: "
+sudo iptables -P OUTPUT DROP                             # set policy last
 
 # Test:
 vm# curl -s --max-time 5 https://example.com   # Works (443 allowed)
@@ -1045,9 +1077,12 @@ vm# sudo iptables -A OUTPUT -o lo -j ACCEPT
 
 ---
 
-### Exercise 7: Enable and read NSG Flow Logs
+### Exercise 7: Enable and read VNet Flow Logs
 
-**Goal:** See traffic decisions at the NSG layer (like VPC Flow Logs).
+**Goal:** See traffic decisions at the network layer (like VPC Flow Logs).
+
+> **Note:** NSG flow log creation is blocked as of June 30, 2025 (retired Sept 2027).
+> Use VNet flow logs — they cover the same traffic with broader scope.
 
 ```bash
 # Create a storage account for flow logs
@@ -1058,11 +1093,11 @@ local$ az storage account create \
   --sku Standard_LRS \
   --output none
 
-# Enable flow logs on the NIC-level NSG
+# Enable flow logs on the VNet (replaces NSG flow logs)
 local$ az network watcher flow-log create \
   --resource-group cloud-sec-lab \
-  --name nsg-nic-flowlog \
-  --nsg nsg-nic \
+  --name vnet-flowlog \
+  --vnet cloud-sec-vnet \
   --storage-account "$STORAGE_NAME" \
   --enabled true \
   --output none
@@ -1073,9 +1108,10 @@ local$ nc -zv -w3 $VM_IP 3306         # Blocked
 
 # Wait ~5 minutes for logs to appear, then check:
 local$ az network watcher flow-log show \
-  --resource-group cloud-sec-lab \
-  --name nsg-nic-flowlog \
-  --output table
+    --location eastus \
+    --name vnet-flowlog \
+    --resource-group cloud-sec-lab \
+    --output table
 ```
 
 **Flow log format (similar to VPC Flow Logs):**
@@ -1149,7 +1185,13 @@ local$ curl -s http://$VM_IP    # Works!
 ### Teardown
 
 ```bash
-# Delete everything in one command (~2 minutes)
+# Step 1: Delete flow log first — it lives in NetworkWatcherRG, NOT cloud-sec-lab
+# Deleting cloud-sec-lab alone leaves this orphaned in NetworkWatcherRG
+local$ az network watcher flow-log delete \
+  --location eastus \
+  --name vnet-flowlog
+
+# Step 2: Delete the lab resource group (~2 minutes)
 local$ az group delete --name cloud-sec-lab --yes --no-wait
 
 # Verify deletion started:
@@ -1215,7 +1257,7 @@ Note: Azure uses NSGs for BOTH subnet-level and NIC-level.
 # CLI examples:
 az network nsg show --name myNSG --resource-group myRG
 az network nsg rule list --nsg-name myNSG --resource-group myRG
-az network watcher flow-log create --nsg myNSG --storage-account myStorage
+az network watcher flow-log create --vnet myVNet --storage-account myStorage
 ```
 
 ### GCP
@@ -1321,9 +1363,9 @@ dmesg | grep GOLD-DROP               # if LOG rules exist
 ss -tlnp                            # listening ports
 curl -s localhost:80                 # local test
 
-# ── Check NSG Flow Logs (Azure) ──
+# ── Check VNet Flow Logs (Azure) ──
 az network watcher flow-log show --resource-group cloud-sec-lab \
-  --name nsg-nic-flowlog --output table
+  --name vnet-flowlog --output table
 # AWS equivalent: VPC Flow Logs in CloudWatch/S3
 
 # ── Audit: Who changed NSG rules? ──

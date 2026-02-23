@@ -202,7 +202,7 @@ Service: nginx on port 80
 If you see this, ALL THREE layers allowed your traffic:
   1. NSG-subnet (NACL equivalent)
   2. NSG-nic   (Security Group equivalent)
-  3. iptables  (OS-level firewall — currently ACCEPT)
+  3. iptables  (OS-level firewall - currently ACCEPT)
 </pre>
 HTML
 CLOUD_INIT
@@ -219,7 +219,7 @@ PUBLIC_IP=$(az network public-ip show \
 PRIVATE_IP=$(az network nic show \
   --resource-group "$RG" \
   --name "${VM_NAME}-nic" \
-  --query ipConfigurations[0].privateIpAddress -o tsv)
+  --query ipConfigurations[0].privateIPAddress -o tsv)
 
 echo "============================================"
 echo "  Lab Ready!"

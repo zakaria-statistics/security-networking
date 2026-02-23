@@ -1,0 +1,766 @@
+# Azure Cloud Security Lab — Manual Setup Guide
+
+> Step-by-step commands to run individually. Set variables once, then run each block at your own pace.
+
+## Table of Contents
+1. [Variables](#1-variables) — Set once, reuse in all steps
+2. [Resource Group](#2-resource-group)
+3. [VNet + Subnets](#3-vnet--subnets)
+4. [NSG — Public Subnet](#4-nsg--public-subnet) — Subnet-level filter (stateful, placement like AWS NACL)
+5. [NSG — Private Subnet](#5-nsg--private-subnet) — Block internet, allow internal traffic only
+6. [Attach NSGs to Subnets](#6-attach-nsgs-to-subnets)
+7. [NSG — web-vm NIC](#7-nsg--web-vm-nic) — Per-VM layer (AWS Security Group equivalent)
+8. [NSG — db-vm NIC](#8-nsg--db-vm-nic) — Per-VM layer, private only
+9. [Public IP](#9-public-ip)
+10. [NICs](#10-nics)
+11. [VM — web-vm](#11-vm--web-vm)
+12. [VM — db-vm](#12-vm--db-vm)
+13. [Verify & Connect](#13-verify--connect)
+14. [Exercises](#14-exercises) — Block traffic, test layers, east-west
+15. [Security Findings](#15-security-findings) — Audit results with severity ratings
+16. [Production Considerations](#16-production-considerations)
+17. [Teardown](#17-teardown)
+
+---
+
+## Architecture
+
+```
+Your PC (internet)
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  VNet: cloud-sec-vnet  (10.0.0.0/16)                            │
+│                                                                  │
+│  ┌─── public-subnet (10.0.1.0/24) ──────────────────────────┐  │
+│  │  NSG-public-subnet                                         │  │
+│  │    Allow: HTTP from *, SSH from MY_IP only                 │  │
+│  │                                                            │  │
+│  │  ┌────────────────────────────────────────────────────┐   │  │
+│  │  │  web-vm  (10.0.1.4)                                │   │  │
+│  │  │  NSG-web-nic  ·  Public IP: yes                    │   │  │
+│  │  │  nginx on :80  ·  iptables (OS firewall)           │   │  │
+│  │  └──────────────────────┬─────────────────────────────┘   │  │
+│  └────────────────────────-┼──────────────────────────────────┘  │
+│                            │ east-west (private IP 10.0.2.4)      │
+│  ┌─────────────────────────┼── private-subnet (10.0.2.0/24) ──┐  │
+│  │  NSG-private-subnet     │                                   │  │
+│  │    Deny:  Internet inbound                                  │  │
+│  │    Allow: SSH + port 3306 from 10.0.1.0/24                 │  │
+│  │                         ▼                                   │  │
+│  │  ┌────────────────────────────────────────────────────┐   │  │
+│  │  │  db-vm  (10.0.2.4)                                 │   │  │
+│  │  │  NSG-db-nic  ·  No public IP                       │   │  │
+│  │  │  MySQL on :3306  (reachable from web-vm only)      │   │  │
+│  │  └────────────────────────────────────────────────────┘   │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+> **Interactive diagram:** https://excalidraw.com/#json=TgyS7V04O5L6PiUSypGI-,ZM2EpUvRgpz88yOZzezWOg
+
+---
+
+## 1. Variables
+
+Set these once in your shell session — all steps below reference them.
+
+```bash
+RG="cloud-sec-lab"
+LOCATION="eastus"
+VNET="cloud-sec-vnet"
+SUBNET_PUB="public-subnet"
+SUBNET_PRIV="private-subnet"
+NSG_SUBNET="nsg-public-subnet"
+NSG_PRIV_SUBNET="nsg-private-subnet"
+NSG_NIC="nsg-web-nic"
+NSG_DB_NIC="nsg-db-nic"
+VM_NAME="web-vm"
+DB_VM_NAME="db-vm"
+VM_SIZE="Standard_B1s"
+VM_IMAGE="Ubuntu2204"
+ADMIN_USER="azurelab"
+MY_IP=$(curl -s https://ifconfig.me)/32   # Your public IP — SSH will be locked to this
+```
+
+---
+
+## 2. Resource Group
+
+```bash
+az group create \
+  --name "$RG" \
+  --location "$LOCATION"
+```
+
+**Verify:**
+```bash
+az group show --name "$RG" --query "{name:name, location:location, state:properties.provisioningState}"
+```
+
+---
+
+## 3. VNet + Subnets
+
+Create VNet with the public subnet in one shot:
+```bash
+az network vnet create \
+  --resource-group "$RG" \
+  --name "$VNET" \
+  --address-prefixes 10.0.0.0/16 \
+  --subnet-name "$SUBNET_PUB" \
+  --subnet-prefixes 10.0.1.0/24
+```
+
+Add the private subnet:
+```bash
+az network vnet subnet create \
+  --resource-group "$RG" \
+  --vnet-name "$VNET" \
+  --name "$SUBNET_PRIV" \
+  --address-prefixes 10.0.2.0/24
+```
+
+**Verify:**
+```bash
+az network vnet subnet list \
+  --resource-group "$RG" \
+  --vnet-name "$VNET" \
+  --output json
+```
+
+---
+
+## 4. NSG — Public Subnet
+
+> This NSG attaches to the **public subnet** — all VMs in the subnet hit this first.
+> Similar to AWS NACLs in *placement* (subnet-wide policy), but unlike NACLs, Azure NSGs
+> are **stateful** — return traffic for established connections is automatically allowed at both levels.
+>
+> **Role here:** Broad, shared policy for the subnet. SSH restricted to your IP only.
+
+Create the NSG:
+```bash
+az network nsg create \
+  --resource-group "$RG" \
+  --name "$NSG_SUBNET"
+```
+
+Allow SSH from your IP only:
+```bash
+az network nsg rule create \
+  --resource-group "$RG" \
+  --nsg-name "$NSG_SUBNET" \
+  --name AllowSSH \
+  --priority 100 \
+  --direction Inbound \
+  --access Allow \
+  --protocol Tcp \
+  --source-port-ranges '*' \
+  --source-address-prefixes "$MY_IP" \
+  --destination-port-ranges 22 \
+  --destination-address-prefixes '*'
+```
+
+Allow HTTP from anywhere:
+```bash
+az network nsg rule create \
+  --resource-group "$RG" \
+  --nsg-name "$NSG_SUBNET" \
+  --name AllowHTTP \
+  --priority 200 \
+  --direction Inbound \
+  --access Allow \
+  --protocol Tcp \
+  --source-port-ranges '*' \
+  --source-address-prefixes '*' \
+  --destination-port-ranges 80 \
+  --destination-address-prefixes '*'
+```
+
+**Verify:**
+```bash
+az network nsg rule list \
+  --resource-group "$RG" \
+  --nsg-name "$NSG_SUBNET" \
+  --output table
+```
+
+---
+
+## 5. NSG — Private Subnet
+
+> This NSG protects the private subnet. It blocks direct internet access while allowing
+> traffic from the public subnet — isolating `db-vm` from any external exposure.
+>
+> **Key difference from the public subnet NSG:** SSH is only allowed *from* `10.0.1.0/24`,
+> not from the internet. `db-vm` has no public IP and no internet route.
+
+Create the NSG:
+```bash
+az network nsg create \
+  --resource-group "$RG" \
+  --name "$NSG_PRIV_SUBNET"
+```
+
+Allow SSH from the public subnet (jump via web-vm):
+```bash
+az network nsg rule create \
+  --resource-group "$RG" \
+  --nsg-name "$NSG_PRIV_SUBNET" \
+  --name AllowSSHFromPublicSubnet \
+  --priority 100 \
+  --direction Inbound \
+  --access Allow \
+  --protocol Tcp \
+  --source-port-ranges '*' \
+  --source-address-prefixes 10.0.1.0/24 \
+  --destination-port-ranges 22 \
+  --destination-address-prefixes '*'
+```
+
+Allow MySQL from the public subnet:
+```bash
+az network nsg rule create \
+  --resource-group "$RG" \
+  --nsg-name "$NSG_PRIV_SUBNET" \
+  --name AllowDBFromPublicSubnet \
+  --priority 200 \
+  --direction Inbound \
+  --access Allow \
+  --protocol Tcp \
+  --source-port-ranges '*' \
+  --source-address-prefixes 10.0.1.0/24 \
+  --destination-port-ranges 3306 \
+  --destination-address-prefixes '*'
+```
+
+Explicitly deny all other internet inbound (makes the block visible in rule list):
+```bash
+az network nsg rule create \
+  --resource-group "$RG" \
+  --nsg-name "$NSG_PRIV_SUBNET" \
+  --name DenyInternetInbound \
+  --priority 4000 \
+  --direction Inbound \
+  --access Deny \
+  --protocol '*' \
+  --source-port-ranges '*' \
+  --source-address-prefixes Internet \
+  --destination-port-ranges '*' \
+  --destination-address-prefixes '*'
+```
+
+**Verify:**
+```bash
+az network nsg rule list \
+  --resource-group "$RG" \
+  --nsg-name "$NSG_PRIV_SUBNET" \
+  --output table
+```
+
+---
+
+## 6. Attach NSGs to Subnets
+
+Attach to public subnet:
+```bash
+az network vnet subnet update \
+  --resource-group "$RG" \
+  --vnet-name "$VNET" \
+  --name "$SUBNET_PUB" \
+  --network-security-group "$NSG_SUBNET"
+```
+
+Attach to private subnet:
+```bash
+az network vnet subnet update \
+  --resource-group "$RG" \
+  --vnet-name "$VNET" \
+  --name "$SUBNET_PRIV" \
+  --network-security-group "$NSG_PRIV_SUBNET"
+```
+
+**Verify both subnets have NSGs attached:**
+```bash
+az network vnet subnet list \
+  --resource-group "$RG" \
+  --vnet-name "$VNET" \
+  --query "[].{name:name, nsg:networkSecurityGroup.id}" \
+  --output table
+```
+
+---
+
+## 7. NSG — web-vm NIC
+
+> This NSG attaches directly to **web-vm's NIC** — second layer after the subnet NSG.
+> Conceptually equivalent to AWS Security Groups (stateful, per-instance).
+>
+> **Role here:** Per-VM specific policy. Even if the subnet NSG is loosened later,
+> this NSG independently enforces web-vm's rules — defense-in-depth in action.
+> See Exercise 1 to test what happens when only one layer blocks traffic.
+
+Create the NSG:
+```bash
+az network nsg create \
+  --resource-group "$RG" \
+  --name "$NSG_NIC"
+```
+
+Allow SSH from your IP:
+```bash
+az network nsg rule create \
+  --resource-group "$RG" \
+  --nsg-name "$NSG_NIC" \
+  --name AllowSSH \
+  --priority 100 \
+  --direction Inbound \
+  --access Allow \
+  --protocol Tcp \
+  --source-port-ranges '*' \
+  --source-address-prefixes "$MY_IP" \
+  --destination-port-ranges 22 \
+  --destination-address-prefixes '*'
+```
+
+Allow HTTP from anywhere:
+```bash
+az network nsg rule create \
+  --resource-group "$RG" \
+  --nsg-name "$NSG_NIC" \
+  --name AllowHTTP \
+  --priority 200 \
+  --direction Inbound \
+  --access Allow \
+  --protocol Tcp \
+  --source-port-ranges '*' \
+  --source-address-prefixes '*' \
+  --destination-port-ranges 80 \
+  --destination-address-prefixes '*'
+```
+
+**Verify:**
+```bash
+az network nsg rule list \
+  --resource-group "$RG" \
+  --nsg-name "$NSG_NIC" \
+  --output table
+```
+
+---
+
+## 8. NSG — db-vm NIC
+
+> This NSG attaches to **db-vm's NIC** — second layer after the private subnet NSG.
+> Both NSG levels independently restrict traffic to db-vm. Even if the subnet NSG is
+> misconfigured, this NIC NSG still blocks traffic from unauthorized sources.
+
+Create the NSG:
+```bash
+az network nsg create \
+  --resource-group "$RG" \
+  --name "$NSG_DB_NIC"
+```
+
+Allow SSH only from the web subnet:
+```bash
+az network nsg rule create \
+  --resource-group "$RG" \
+  --nsg-name "$NSG_DB_NIC" \
+  --name AllowSSHFromWebSubnet \
+  --priority 100 \
+  --direction Inbound \
+  --access Allow \
+  --protocol Tcp \
+  --source-port-ranges '*' \
+  --source-address-prefixes 10.0.1.0/24 \
+  --destination-port-ranges 22 \
+  --destination-address-prefixes '*'
+```
+
+Allow MySQL only from the web subnet:
+```bash
+az network nsg rule create \
+  --resource-group "$RG" \
+  --nsg-name "$NSG_DB_NIC" \
+  --name AllowDBFromWebSubnet \
+  --priority 200 \
+  --direction Inbound \
+  --access Allow \
+  --protocol Tcp \
+  --source-port-ranges '*' \
+  --source-address-prefixes 10.0.1.0/24 \
+  --destination-port-ranges 3306 \
+  --destination-address-prefixes '*'
+```
+
+**Verify:**
+```bash
+az network nsg rule list \
+  --resource-group "$RG" \
+  --nsg-name "$NSG_DB_NIC" \
+  --output table
+```
+
+---
+
+## 9. Public IP
+
+> `db-vm` intentionally has no public IP — private resources should have no internet-facing endpoint.
+
+```bash
+az network public-ip create \
+  --resource-group "$RG" \
+  --name "${VM_NAME}-pip" \
+  --sku Standard \
+  --allocation-method Static
+```
+
+**Verify:**
+```bash
+az network public-ip show \
+  --resource-group "$RG" \
+  --name "${VM_NAME}-pip" \
+  --query "{ip:ipAddress, sku:sku.name, allocation:publicIpAllocationMethod}"
+```
+
+---
+
+## 10. NICs
+
+Create web-vm NIC (public subnet, NIC NSG, public IP):
+```bash
+az network nic create \
+  --resource-group "$RG" \
+  --name "${VM_NAME}-nic" \
+  --vnet-name "$VNET" \
+  --subnet "$SUBNET_PUB" \
+  --network-security-group "$NSG_NIC" \
+  --public-ip-address "${VM_NAME}-pip"
+```
+
+Create db-vm NIC (private subnet, db NIC NSG, no public IP):
+```bash
+az network nic create \
+  --resource-group "$RG" \
+  --name "${DB_VM_NAME}-nic" \
+  --vnet-name "$VNET" \
+  --subnet "$SUBNET_PRIV" \
+  --network-security-group "$NSG_DB_NIC"
+```
+
+**Verify both NICs:**
+```bash
+az network nic list \
+  --resource-group "$RG" \
+  --query "[].{name:name, privateIp:ipConfigurations[0].privateIpAddress, nsg:networkSecurityGroup.id}" \
+  --output table
+```
+
+---
+
+## 11. VM — web-vm
+
+> `--generate-ssh-keys` creates `~/.ssh/id_rsa` if it doesn't exist. Cloud-init installs
+> nginx and iptables on first boot.
+
+```bash
+az vm create \
+  --resource-group "$RG" \
+  --name "$VM_NAME" \
+  --nics "${VM_NAME}-nic" \
+  --image "$VM_IMAGE" \
+  --size "$VM_SIZE" \
+  --admin-username "$ADMIN_USER" \
+  --generate-ssh-keys \
+  --custom-data @- <<'CLOUD_INIT'
+#!/bin/bash
+apt-get update -qq
+apt-get install -y -qq nginx conntrack iptables > /dev/null 2>&1
+systemctl enable --now nginx
+cat > /var/www/html/index.html <<'HTML'
+<pre>
+=== Cloud Security Lab ===
+Host: web-vm
+Service: nginx on port 80
+
+If you see this, ALL THREE layers allowed your traffic:
+  1. NSG-public-subnet  (subnet-level, stateful — placement like AWS NACL)
+  2. NSG-web-nic        (NIC-level, stateful — equivalent to AWS Security Group)
+  3. iptables           (OS-level firewall — currently ACCEPT, see Exercise 3 to harden)
+</pre>
+HTML
+CLOUD_INIT
+```
+
+> VM provisioning takes ~60 seconds. Cloud-init (nginx install) takes another ~2 min.
+
+**Verify:**
+```bash
+az vm show \
+  --resource-group "$RG" \
+  --name "$VM_NAME" \
+  --query "{state:powerState, size:hardwareProfile.vmSize}" \
+  --show-details
+```
+
+---
+
+## 12. VM — db-vm
+
+> `db-vm` has no public IP. It is only reachable via SSH through `web-vm` (jump-host pattern).
+> MySQL is configured to listen on all interfaces so you can test port 3306 from web-vm.
+
+```bash
+az vm create \
+  --resource-group "$RG" \
+  --name "$DB_VM_NAME" \
+  --nics "${DB_VM_NAME}-nic" \
+  --image "$VM_IMAGE" \
+  --size "$VM_SIZE" \
+  --admin-username "$ADMIN_USER" \
+  --generate-ssh-keys \
+  --custom-data @- <<'CLOUD_INIT'
+#!/bin/bash
+apt-get update -qq
+apt-get install -y -qq mysql-server netcat-openbsd > /dev/null 2>&1
+# Bind to all interfaces so web-vm can connect over the private network
+sed -i "s/bind-address.*/bind-address = 0.0.0.0/" /etc/mysql/mysql.conf.d/mysqld.cnf
+systemctl enable --now mysql
+# Set root password and create a limited network user (avoids unauthenticated access)
+mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH caching_sha2_password BY 'LabPass123!'; FLUSH PRIVILEGES;"
+mysql -e "CREATE USER 'webuser'@'10.0.1.%' IDENTIFIED BY 'LabUser456!'; GRANT SELECT ON *.* TO 'webuser'@'10.0.1.%'; FLUSH PRIVILEGES;"
+CLOUD_INIT
+```
+
+**Verify:**
+```bash
+az vm show \
+  --resource-group "$RG" \
+  --name "$DB_VM_NAME" \
+  --query "{state:powerState, size:hardwareProfile.vmSize}" \
+  --show-details
+```
+
+---
+
+## 13. Verify & Connect
+
+Get web-vm public IP:
+```bash
+PUBLIC_IP=$(az network public-ip show \
+  --resource-group "$RG" \
+  --name "${VM_NAME}-pip" \
+  --query ipAddress -o tsv)
+echo $PUBLIC_IP
+```
+
+Get private IPs:
+```bash
+WEB_PRIVATE_IP=$(az network nic show \
+  --resource-group "$RG" \
+  --name "${VM_NAME}-nic" \
+  --query "ipConfigurations[0].privateIpAddress" -o tsv)
+echo "web-vm private: $WEB_PRIVATE_IP"
+
+DB_PRIVATE_IP=$(az network nic show \
+  --resource-group "$RG" \
+  --name "${DB_VM_NAME}-nic" \
+  --query "ipConfigurations[0].privateIpAddress" -o tsv)
+echo "db-vm private:  $DB_PRIVATE_IP"
+```
+
+Test HTTP (wait ~2 min after VM creation for cloud-init):
+```bash
+curl http://$PUBLIC_IP
+```
+
+SSH into web-vm (north-south):
+```bash
+ssh ${ADMIN_USER}@${PUBLIC_IP}
+```
+
+SSH into db-vm via web-vm (jump-host pattern — db-vm has no public IP):
+```bash
+ssh -J ${ADMIN_USER}@${PUBLIC_IP} ${ADMIN_USER}@${DB_PRIVATE_IP}
+```
+
+---
+
+## 14. Exercises
+
+### Exercise 1 — Test NSG Layering (Remove One Layer)
+
+This shows that **both** NSG layers must allow traffic — blocking at either layer is sufficient to deny.
+
+```bash
+# First confirm HTTP works
+curl http://$PUBLIC_IP
+
+# Remove HTTP from the NIC-level NSG
+az network nsg rule delete \
+  --resource-group "$RG" \
+  --nsg-name "$NSG_NIC" \
+  --name AllowHTTP
+
+# Test again — should time out even though the subnet NSG still allows HTTP
+curl --max-time 5 http://$PUBLIC_IP
+
+# Restore
+az network nsg rule create \
+  --resource-group "$RG" \
+  --nsg-name "$NSG_NIC" \
+  --name AllowHTTP \
+  --priority 200 --direction Inbound --access Allow \
+  --protocol Tcp \
+  --source-port-ranges '*' --source-address-prefixes '*' \
+  --destination-port-ranges 80 --destination-address-prefixes '*'
+```
+
+---
+
+### Exercise 2 — East-West Traffic (web-vm → db-vm)
+
+This shows NSGs controlling lateral (VM-to-VM) movement, not just north-south ingress.
+
+```bash
+# SSH into web-vm
+ssh ${ADMIN_USER}@${PUBLIC_IP}
+
+# Inside web-vm — test east-west connectivity to db-vm
+nc -zv $DB_PRIVATE_IP 3306   # should succeed
+nc -zv $DB_PRIVATE_IP 22     # should succeed
+```
+
+Now block east-west DB access at the private subnet NSG:
+```bash
+az network nsg rule create \
+  --resource-group "$RG" \
+  --nsg-name "$NSG_PRIV_SUBNET" \
+  --name DenyDB \
+  --priority 150 \
+  --direction Inbound \
+  --access Deny \
+  --protocol Tcp \
+  --source-port-ranges '*' \
+  --source-address-prefixes 10.0.1.0/24 \
+  --destination-port-ranges 3306 \
+  --destination-address-prefixes '*'
+```
+
+```bash
+# Back inside web-vm — port 3306 should now be blocked
+nc -zv $DB_PRIVATE_IP 3306   # should fail
+nc -zv $DB_PRIVATE_IP 22     # still works (SSH rule unchanged)
+```
+
+> NSG rule priority 150 is evaluated before the Allow rule at priority 200.
+
+---
+
+### Exercise 3 — Harden iptables (Layer 3)
+
+iptables currently accepts all traffic — the nginx landing page says so. Set a default deny and verify the three-layer model holds.
+
+```bash
+# SSH into web-vm
+ssh ${ADMIN_USER}@${PUBLIC_IP}
+
+# Inside web-vm — add explicit ACCEPT rules then set default DROP
+sudo iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A INPUT -i lo -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+sudo iptables -P INPUT DROP
+sudo iptables -P FORWARD DROP
+```
+
+Verify HTTP still works from your machine (all three layers still allow it):
+```bash
+curl http://$PUBLIC_IP
+```
+
+Now block port 80 at the OS level only:
+```bash
+# Inside web-vm
+sudo iptables -I INPUT 1 -p tcp --dport 80 -j DROP
+```
+
+```bash
+# From your machine — times out; iptables drops it before nginx sees it
+curl --max-time 5 http://$PUBLIC_IP
+```
+
+> Both NSGs allow port 80 — but iptables (layer 3) independently blocks it.
+> Restore with: `sudo iptables -D INPUT 1`
+
+---
+
+## 15. Security Findings
+
+> Audit of this lab's current state. Each finding notes whether it is **lab-intentional** (acceptable simplification) or a **genuine gap** to fix.
+
+### Critical
+
+| ID | Finding | Fix |
+|----|---------|-----|
+| C1 | ~~MySQL with no authentication~~ — **Fixed in cloud-init** | Root password set; `webuser` created for network access from `10.0.1.%` only |
+| C2 | MySQL bound to `0.0.0.0` instead of private IP | Acceptable for lab (NSGs protect it); in production bind to `10.0.2.4` |
+
+### High
+
+| ID | Finding | Lab-Intentional? | Fix |
+|----|---------|-----------------|-----|
+| H1 | No TLS — HTTP traffic in plaintext | Yes | Self-signed cert + nginx HTTPS redirect; NSG rule for 443 |
+| H2 | No outbound/egress NSG rules — compromised VM can freely exfiltrate | Yes | Add Outbound rules: Allow DNS(53) + HTTPS(443), Deny `*` at priority 4000 |
+| H3 | SSH port 22 exposed to internet (IP-locked but fragile — DHCP/NAT changes) | Partially | Azure Bastion or JIT VM Access removes port 22 from internet entirely |
+| H4 | iptables default ACCEPT on web-vm until Exercise 3 | Yes — Exercise 3 hardens it | Complete Exercise 3 and persist with `iptables-persistent` |
+| H5 | `--generate-ssh-keys` creates the same key pair for both VMs — shared key = lateral movement risk | Yes | Generate separate keys: `ssh-keygen -t ed25519 -f ~/.ssh/id_web` and `id_db` |
+
+### Medium
+
+| ID | Finding | Lab-Intentional? | Fix |
+|----|---------|-----------------|-----|
+| M1 | No NSG flow logs — zero traffic visibility | Partially | Enable via `az network watcher flow-log create` on both NSGs |
+| M2 | Microsoft Defender for Cloud not enabled | Yes (cost) | Free tier: `az security pricing create --name VirtualMachines --tier Free` |
+| M3 | DB NSG rules allow entire `10.0.1.0/24` instead of web-vm's specific IP | Yes (lab simplicity) | In production, use web-vm's static private IP as source |
+| M4 | No Activity Log export or diagnostic settings | Yes | Export to Log Analytics: `az monitor diagnostic-settings create` |
+| M5 | No customer-managed disk encryption | Yes (default SSE covers it) | `az vm encryption enable` with Key Vault |
+| M6 | `--destination-address-prefixes '*'` on all NSG rules | Yes (implicit) | Use `VirtualNetwork` service tag instead of `*` for defense-in-depth |
+
+### Low
+
+| ID | Finding | Fix |
+|----|---------|-----|
+| L1 | Predictable admin username `azurelab` | Change to less obvious name; enforce key-only auth in `sshd_config` |
+| L2 | No resource locks on critical resources | `az lock create --lock-type CanNotDelete --name lab-lock -g "$RG"` |
+| L3 | No VM auto-shutdown (cost + hygiene) | `az vm auto-shutdown -g "$RG" -n "$VM_NAME" --time 2300` |
+| L4 | Full CLI credentials — no RBAC scoping | Create a custom role scoped to the resource group for lab use |
+
+---
+
+## 16. Production Considerations
+
+These gaps are intentional for lab simplicity. In production environments:
+
+| Gap | Lab State | Production Approach |
+|-----|-----------|-------------------|
+| SSH source restriction | Locked to `MY_IP` | Azure Bastion or JIT VM Access (removes port 22 from internet entirely) |
+| HTTP (no TLS) | Port 80 only | HTTPS with certificate; HTTP → HTTPS redirect |
+| NSG flow logs | Not enabled | Enable on both NSGs → Log Analytics → traffic analysis and alerting |
+| iptables default | ACCEPT (see Exercise 3) | Default DROP with explicit allows; persist with `iptables-persistent` |
+| Outbound rules | All outbound allowed | Restrict egress: allow DNS (53) + HTTPS (443), deny rest |
+| Disk encryption | Platform-managed keys (default) | Customer-managed keys via Key Vault |
+| Microsoft Defender | Off | Free tier: `az security pricing create --name VirtualMachines --tier Free` |
+| Resource tags | None | `az group update --name "$RG" --tags Environment=Lab Owner=student` |
+
+---
+
+## 17. Teardown
+
+```bash
+az group delete --name "$RG" --yes --no-wait
+```
+
+Cost while running: ~$0.02/hour (two Standard_B1s VMs)

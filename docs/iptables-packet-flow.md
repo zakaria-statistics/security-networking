@@ -438,7 +438,7 @@ Right:  DROP in filter table   → After conntrack, can match ESTABLISHED
                        ▼ (if ACCEPT)
               ┌─────────────────┐
               │  Local Process  │
-              │  (sshd, nginx)  │
+              │  (sshd)         
               └─────────────────┘
 ```
 

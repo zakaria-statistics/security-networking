@@ -225,9 +225,9 @@ Once forwarding is permitted, the kernel consults its routing table to determine
 ```
 Destination        Gateway         Interface
 ─────────────────────────────────────────────
-10.10.0.0/24       0.0.0.0         bridge_a
-10.20.0.0/24       0.0.0.0         bridge_b
-0.0.0.0/0          192.168.11.1    eth0
+10.10.0.0/24       0.0.0.0         bridge_a    ← 0.0.0.0 = directly connected, host IS the gateway (10.10.0.1)
+10.20.0.0/24       0.0.0.0         bridge_b    ← 0.0.0.0 = directly connected, host IS the gateway (10.20.0.1)
+0.0.0.0/0          192.168.11.1    eth0        ← default route: remote traffic hops to LAN router
 ```
 
 ### 3. iptables (The Policy Enforcer and Modifier)
@@ -598,29 +598,47 @@ Docker does not use syscalls directly for iptables. It uses the **netlink** inte
 **nat table:**
 
 ```bash
+# Create the DOCKER chain in the nat table
 iptables -t nat -N DOCKER
+# Redirect inbound traffic destined for a local address into the DOCKER chain
 iptables -t nat -A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+# Same redirect for locally-generated traffic (excluding loopback)
 iptables -t nat -A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
+# Masquerade (SNAT) traffic leaving containers to the outside world
 iptables -t nat -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
 ```
 
 **filter table:**
 
 ```bash
+# Create Docker-managed chains in the filter table
 iptables -N DOCKER
 iptables -N DOCKER-ISOLATION-STAGE-1
 iptables -N DOCKER-ISOLATION-STAGE-2
+# User-defined rules go here; evaluated first so users can override Docker defaults
 iptables -N DOCKER-USER
+
+# FORWARD chain: hand off to user rules first, then Docker isolation checks
 iptables -A FORWARD -j DOCKER-USER
 iptables -A FORWARD -j DOCKER-ISOLATION-STAGE-1
+# Allow return traffic for already-established connections into docker0
 iptables -A FORWARD -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+# Send new inbound connections to docker0 through the DOCKER chain (port-mapping rules live here)
 iptables -A FORWARD -o docker0 -j DOCKER
+# Allow containers to reach external networks (egress)
 iptables -A FORWARD -i docker0 ! -o docker0 -j ACCEPT
+# Allow container-to-container traffic on the same bridge
 iptables -A FORWARD -i docker0 -o docker0 -j ACCEPT
+
+# Stage 1: flag traffic leaving docker0 toward another network for stage-2 inspection
 iptables -A DOCKER-ISOLATION-STAGE-1 -i docker0 ! -o docker0 -j DOCKER-ISOLATION-STAGE-2
 iptables -A DOCKER-ISOLATION-STAGE-1 -j RETURN
+
+# Stage 2: drop cross-network traffic arriving at docker0 (prevents inter-network leakage)
 iptables -A DOCKER-ISOLATION-STAGE-2 -o docker0 -j DROP
 iptables -A DOCKER-ISOLATION-STAGE-2 -j RETURN
+
+# End of user chain — return to FORWARD for further processing
 iptables -A DOCKER-USER -j RETURN
 ```
 
@@ -682,34 +700,55 @@ iptables -A DOCKER-USER -j RETURN
 
 **Isolation Stage 1:**
 
+Stage 1 gets **one rule per Docker network bridge** — not just docker0. Each rule flags
+traffic that is leaving its home bridge toward any other interface.
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  filter / DOCKER-ISOLATION-STAGE-1                          │
-│                                                             │
-│  -i docker0 ! -o docker0 -j DOCKER-ISOLATION-STAGE-2        │
-│                                                             │
-│  Translation:                                               │
-│    Input: docker0                                           │
-│    Output: NOT docker0 (different network)                  │
-│    Action: Jump to stage 2 for further checks               │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  filter / DOCKER-ISOLATION-STAGE-1                               │
+│                                                                  │
+│  -i docker0   ! -o docker0   -j DOCKER-ISOLATION-STAGE-2        │
+│  -i br-abc123 ! -o br-abc123 -j DOCKER-ISOLATION-STAGE-2        │
+│  -i br-def456 ! -o br-def456 -j DOCKER-ISOLATION-STAGE-2        │
+│  -j RETURN                                                       │
+│                                                                  │
+│  Translation:                                                    │
+│    "If traffic arrived on bridge X and is leaving via any        │
+│     interface that is NOT bridge X, escalate to stage 2."        │
+│                                                                  │
+│  Each docker network create adds a new rule here for its bridge. │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 **Isolation Stage 2:**
 
+Stage 2 receives traffic that has already left its home bridge. It then checks whether
+that traffic is trying to land on **any other Docker bridge** and drops it if so.
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  filter / DOCKER-ISOLATION-STAGE-2                          │
-│                                                             │
-│  -o docker0 -j DROP                                         │
-│                                                             │
-│  Translation:                                               │
-│    Output: docker0                                          │
-│    Action: Drop                                             │
-│                                                             │
-│  Why: Traffic from one Docker network trying to reach       │
-│       another Docker network gets dropped here              │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  filter / DOCKER-ISOLATION-STAGE-2                               │
+│                                                                  │
+│  -o docker0   -j DROP                                            │
+│  -o br-abc123 -j DROP                                            │
+│  -o br-def456 -j DROP                                            │
+│  -j RETURN                                                       │
+│                                                                  │
+│  Translation:                                                    │
+│    "If traffic is arriving at any Docker bridge, drop it."       │
+│                                                                  │
+│  Why this works with Stage 1:                                    │
+│    docker0 → br-abc123:                                          │
+│      Stage 1: -i docker0 ! -o docker0   ✓ → jump to Stage 2     │
+│      Stage 2: -o br-abc123              ✓ → DROP                 │
+│                                                                  │
+│    br-abc123 → docker0:                                          │
+│      Stage 1: -i br-abc123 ! -o br-abc123 ✓ → jump to Stage 2   │
+│      Stage 2: -o docker0                ✓ → DROP                 │
+│                                                                  │
+│  Traffic to eth0/internet is NOT dropped — Stage 2 only matches  │
+│  Docker bridges. External egress is handled by MASQUERADE.       │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ### Scenario 2: Run Container with Published Port
@@ -777,7 +816,7 @@ iptables -A DOCKER-ISOLATION-STAGE-2 -o br-abc123 -j DROP
 # filter table - allow internal and outbound
 iptables -A FORWARD -o br-abc123 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 iptables -A FORWARD -i br-abc123 ! -o br-abc123 -j ACCEPT
-iptables -A FORWARD -i br-abc123 -o br-abc123 -j ACCEPT
+iptables -A FORWARD -i br-abc123 -o br-abc123 -j ACCEPT ==> for ICC disabled scenario
 ```
 
 ### Scenario 4: Two Networks, Isolation in Action

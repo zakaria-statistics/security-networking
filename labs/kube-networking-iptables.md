@@ -67,6 +67,87 @@ from [nat-lab.md](nat-lab.md) — applied at cluster scale.
 **ClusterIP (default):**
 
 ```
+CASE 1: Pod B is on the SAME node as Pod A
+─────────────────────────────────────────────
+
+┌──────────────────────── Node 1 (.109) ──────────────────────────────┐
+│                                                                      │
+│  ┌──────────┐    OUTPUT chain      ┌─────────────────────────────┐  │
+│  │  Pod A   │─────────────────────►│  KUBE-SERVICES              │  │
+│  │ 10.244.  │ dst=10.96.0.10:80   │                             │  │
+│  │  1.5     │                      │  match 10.96.0.10 ─────┐   │  │
+│  └──────────┘                      │                        │   │  │
+│                                    │  KUBE-SVC-XXXXX        │   │  │
+│       ▲                            │   ├─ 50% KUBE-SEP-A    │   │  │
+│       │ conntrack                  │   └─ 50% KUBE-SEP-B ───┘   │  │
+│       │ reverses DNAT              └────────────┬────────────────┘  │
+│       │                                         │ DNAT              │
+│       │                                         ▼                   │
+│       │                              dst → 10.244.1.8:8080         │
+│       │                                         │                   │
+│       │              routed locally via cbr0/cni0 bridge            │
+│       │                                         │                   │
+│  ┌────┴─────┐                                   │                   │
+│  │  Pod B   │◄──────────────────────────────────┘                   │
+│  │ 10.244.  │                                                       │
+│  │  1.8     │  same node → no MASQUERADE needed                    │
+│  └──────────┘  src stays as Pod A's IP (10.244.1.5)                │
+│                                                                      │
+│  ⚠ 10.96.0.10 has NO interface — it's virtual, lives ONLY in       │
+│    iptables DNAT rules                                              │
+└──────────────────────────────────────────────────────────────────────┘
+
+
+CASE 2: Pod B is on a DIFFERENT node
+─────────────────────────────────────
+
+┌──────────────────────── Node 1 (.109) ──────────────────────────────┐
+│                                                                      │
+│  ┌──────────┐    OUTPUT chain      ┌─────────────────────────────┐  │
+│  │  Pod A   │─────────────────────►│  KUBE-SERVICES              │  │
+│  │ 10.244.  │ dst=10.96.0.10:80   │                             │  │
+│  │  1.5     │                      │  match 10.96.0.10 ─────┐   │  │
+│  └──────────┘                      │                        │   │  │
+│       ▲                            │  KUBE-SVC-XXXXX        │   │  │
+│       │                            │   ├─ 50% KUBE-SEP-A    │   │  │
+│       │                            │   └─ 50% KUBE-SEP-B ───┘   │  │
+│       │                            └────────────┬────────────────┘  │
+│       │                                         │ DNAT              │
+│       │                                         ▼                   │
+│       │                              dst → 10.244.2.8:8080         │
+│       │                                         │                   │
+│       │                              FORWARD chain allows           │
+│       │                                         │                   │
+│       │                              POSTROUTING: MASQUERADE        │
+│       │ conntrack                    src → .109 (node1 IP)          │
+│       │ un-MASQ + un-DNAT                       │                   │
+│       │                                         │                   │
+└───────┼─────────────────────────────────────────┼────────────────────┘
+        │          CNI overlay (VXLAN/host-gw)    │
+        │                                         ▼
+┌───────┼──────────────────── Node 2 (.110) ──────────────────────────┐
+│       │                                                              │
+│       │                              PREROUTING (no DNAT needed,    │
+│       │                              dst is already pod IP)          │
+│       │                                         │                   │
+│       │                              routed to local pod via bridge  │
+│       │                                         │                   │
+│  ┌────┴─────┐                                   │                   │
+│  │  Pod B   │◄──────────────────────────────────┘                   │
+│  │ 10.244.  │                                                       │
+│  │  2.8     │  sees src=.109 (node1 IP) due to MASQUERADE          │
+│  └──────────┘  → response goes to Node1 → conntrack restores       │
+│                  original src/dst → delivered back to Pod A          │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+
+Why MASQUERADE on cross-node?
+  Pod B would reply to Pod A's IP (10.244.1.5) directly,
+  bypassing Node 1 — breaking conntrack's DNAT reversal.
+  MASQUERADE forces the return path through Node 1.
+```
+
+```
 Pod A (10.244.1.5) → Service "my-svc" (10.96.0.10:80)
 
 1. Pod A sends packet: src=10.244.1.5, dst=10.96.0.10:80
@@ -80,6 +161,89 @@ in iptables DNAT rules.
 ```
 
 **NodePort:**
+
+```
+CASE 1: DNAT lands on a pod on the SAME node
+──────────────────────────────────────────────
+
+                    ┌──────────────┐
+                    │ External     │
+                    │ Client       │
+                    │ 192.168.11.50│
+                    └──────┬───────┘
+                           │ dst=192.168.11.109:30080
+                           ▼
+┌──────────────────────── Node 1 (.109) ──────────────────────────────┐
+│                                                                      │
+│  PREROUTING → KUBE-SERVICES → KUBE-NODEPORTS                       │
+│       │                                                              │
+│       ▼                                                              │
+│  KUBE-SVC-XXXXX (load balance)                                      │
+│       │                                                              │
+│       ▼                                                              │
+│  KUBE-SEP-A: DNAT dst → 10.244.1.5:8080                            │
+│       │                                                              │
+│       │  packet stays local — routed via cni0/cbr0 bridge           │
+│       │  no MASQUERADE (src stays as client IP .50)                 │
+│       ▼                                                              │
+│  ┌──────────┐                                                       │
+│  │  Pod A   │  sees real client IP: src=192.168.11.50               │
+│  │ 10.244.  │                                                       │
+│  │  1.5     │  response → conntrack un-DNAT                        │
+│  └──────────┘  dst .50 → routed out node's eth0 → client           │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+
+
+CASE 2: DNAT lands on a pod on a DIFFERENT node
+─────────────────────────────────────────────────
+
+                    ┌──────────────┐
+                    │ External     │
+                    │ Client       │
+                    │ 192.168.11.50│
+                    └──────┬───────┘
+                           │ dst=192.168.11.109:30080
+                           ▼
+┌──────────────────────── Node 1 (.109) ──────────────────────────────┐
+│                                                                      │
+│  PREROUTING → KUBE-SERVICES → KUBE-NODEPORTS                       │
+│       │                                                              │
+│       ▼                                                              │
+│  KUBE-SVC-XXXXX (load balance)                                      │
+│       │                                                              │
+│       ▼                                                              │
+│  KUBE-SEP-B: DNAT dst → 10.244.2.8:8080   (pod on Node 2)         │
+│       │                                                              │
+│       │  FORWARD chain allows (dst is not local)                    │
+│       │                                                              │
+│       ▼                                                              │
+│  POSTROUTING: MASQUERADE                                             │
+│  src rewritten: 192.168.11.50 → 192.168.11.109 (node1 IP)          │
+│       │                                                              │
+│       │  ▲ return: conntrack un-MASQ + un-DNAT → back to client    │
+│       │  │                                                           │
+└───────┼──┼───────────────────────────────────────────────────────────┘
+        │  │       CNI overlay (VXLAN / host-gw)
+        ▼  │
+┌──────────────────────── Node 2 (.110) ──────────────────────────────┐
+│                                                                      │
+│       │  dst is already pod IP → no further DNAT                    │
+│       │  routed to local pod via bridge                              │
+│       ▼                                                              │
+│  ┌──────────┐                                                       │
+│  │  Pod B   │  sees src=192.168.11.109 (node1 IP, NOT client)      │
+│  │ 10.244.  │                                                       │
+│  │  2.8     │  response dst=.109 → goes to Node 1                  │
+│  └──────────┘  Node 1 conntrack: un-MASQ + un-DNAT → client .50    │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+
+Why MASQUERADE on cross-node?
+  Without it, Pod B replies directly to client (.50).
+  Client receives a packet from .110 but expects it from .109
+  → connection breaks. MASQUERADE forces return through Node 1.
+```
 
 ```
 External client (192.168.11.50) → Node (192.168.11.109):30080
@@ -97,6 +261,42 @@ This is EXACTLY the DNAT + MASQUERADE pattern from nat-lab.md!
 ```
 
 **LoadBalancer:**
+
+```
+              ┌─────────────────────────┐
+              │     Internet / User     │
+              └───────────┬─────────────┘
+                          │
+                          ▼
+              ┌─────────────────────────┐
+              │   External Load Balancer│
+              │   (AWS ELB / MetalLB)   │
+              │   VIP: 203.0.113.10     │
+              │                         │
+              │  health-checks nodes    │
+              │  on NodePort 30080      │
+              └──┬──────────────────┬───┘
+                 │                  │
+          ┌──────┘                  └──────┐
+          ▼                                ▼
+┌──── Node 1 (.109) ────┐     ┌──── Node 2 (.110) ────┐
+│                        │     │                        │
+│  :30080 (NodePort)     │     │  :30080 (NodePort)     │
+│     │                  │     │     │                  │
+│     ▼                  │     │     ▼                  │
+│  KUBE-SERVICES         │     │  KUBE-SERVICES         │
+│     │                  │     │     │                  │
+│     ▼                  │     │     ▼                  │
+│  DNAT → pod endpoint   │     │  DNAT → pod endpoint   │
+│  (same NodePort flow)  │     │  (same NodePort flow)  │
+│                        │     │                        │
+│  ┌────────┐            │     │  ┌────────┐            │
+│  │ Pod A  │            │     │  │ Pod B  │            │
+│  └────────┘            │     │  └────────┘            │
+└────────────────────────┘     └────────────────────────┘
+
+LoadBalancer = NodePort + cloud-provisioned external LB
+```
 
 ```
 Cloud LB → NodePort → kube-proxy DNAT → Pod
@@ -143,6 +343,69 @@ filter table:
 ```bash
 kubectl create deployment web --image=nginx --replicas=3
 kubectl expose deployment web --port=80 --type=ClusterIP
+```
+
+**How kube-proxy knows what to write into iptables:**
+
+```
+kubectl expose deployment web --port=80 --type=ClusterIP
+        │
+        ▼
+┌─ API Server creates a Service object ──────────────────────────────┐
+│                                                                     │
+│  kind: Service                                                      │
+│  metadata:                                                          │
+│    name: web                                                        │
+│  spec:                                                              │
+│    type: ClusterIP                                                  │
+│    clusterIP: 10.96.45.123    ◄── auto-assigned from --service-     │
+│    ports:                          cluster-ip-range (default        │
+│      - port: 80                    10.96.0.0/12), stored in etcd   │
+│    selector:                                                        │
+│      app: web                 ◄── label selector from deployment   │
+│                                                                     │
+└──────────────┬──────────────────────────────────────────────────────┘
+               │
+               ▼
+┌─ Endpoint controller (in kube-controller-manager) ─────────────────┐
+│                                                                     │
+│  Watches: Service.spec.selector  →  { app: web }                   │
+│  Finds:   all Pods matching label "app=web" that are Ready         │
+│  Creates: EndpointSlice object                                      │
+│                                                                     │
+│  endpoints:                                                         │
+│    - 10.244.1.5:80   (pod on node1)                                │
+│    - 10.244.2.8:80   (pod on node2)                                │
+│    - 10.244.3.2:80   (pod on node3)                                │
+│                                                                     │
+│  These IPs come from each pod's CNI allocation                     │
+│  (each node has a subnet /24 from --pod-network-cidr 10.244.0.0/16)      │
+│                                                                     │
+└──────────────┬──────────────────────────────────────────────────────┘
+               │
+               ▼
+┌─ kube-proxy (runs on EVERY node, watches API server) ──────────────┐
+│                                                                     │
+│  Watches:  Service + EndpointSlice objects via API server           │
+│  Reads:    clusterIP=10.96.45.123, port=80, protocol=tcp           │
+│            endpoints=[10.244.1.5:80, 10.244.2.8:80, 10.244.3.2:80]│
+│                                                                     │
+│  Generates iptables rules from this data:                           │
+│                                                                     │
+│    match fields:                                                    │
+│      -d 10.96.45.123/32  ← from Service.spec.clusterIP            │
+│      -p tcp              ← from Service.spec.ports[].protocol      │
+│      --dport 80          ← from Service.spec.ports[].port          │
+│                                                                     │
+│    chain name:                                                      │
+│      KUBE-SVC-ABCDEF     ← hash of Service namespace+name+port    │
+│                                                                     │
+│    DNAT targets:                                                    │
+│      10.244.1.5:80       ← from EndpointSlice addresses            │
+│      10.244.2.8:80                                                  │
+│      10.244.3.2:80                                                  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 **What kube-proxy creates:**
@@ -225,12 +488,12 @@ Pod A (10.244.1.5) calls Service (10.96.45.123:80)
 ```
 ping 10.96.45.123
 
-ICMP goes through OUTPUT chain → KUBE-SERVICES → KUBE-SVC-ABCDEF
-→ DNAT to a pod endpoint
+ICMP goes through OUTPUT chain → KUBE-SERVICES
 
-BUT: ICMP doesn't match the TCP rule in KUBE-SVC-ABCDEF
-     (the rule is -p tcp --dport 80)
-     ICMP falls through with no match → no DNAT → packet goes nowhere
+BUT: ICMP doesn't match the rule in KUBE-SERVICES
+     (the rule is -d 10.96.45.123/32 -p tcp --dport 80 -j KUBE-SVC-ABCDEF)
+     ICMP is not TCP → rule doesn't match → never enters KUBE-SVC-ABCDEF
+     Falls through KUBE-SERVICES with no match → no DNAT → packet goes nowhere
      No interface owns 10.96.45.123 → ICMP unreachable
 ```
 
@@ -296,7 +559,7 @@ Client (.50) ──► Node-1:30080
                     ├─ PREROUTING → DNAT: dst → 10.244.2.8:80 (pod on Node-2)
                     ├─ Routing: not local → FORWARD chain
                     ├─ POSTROUTING: MASQUERADE (src = Node-1's IP)
-                    └─ Packet sent to Node-2 via pod network
+                    └─ Packet sent to Node-2 via CNI route (VXLAN tunnel, BGP, etc.)
                               │
                     Node-2 receives: src=Node-1, dst=10.244.2.8:80
                               │
